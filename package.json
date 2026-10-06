@@ -1,0 +1,39 @@
+{
+  "name": "zero-flow-editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero Flow — offline desktop video editor with real FFmpeg rendering",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n vite,electron -c cyan,magenta \"vite\" \"node scripts/dev-electron.mjs\"",
+    "build": "vite build && node scripts/build-electron.mjs",
+    "build:check": "tsc -p tsconfig.electron.json --noEmit && tsc --noEmit",
+    "preview": "vite preview",
+    "start": "electron .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.2.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.545.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "sonner": "^2.0.8",
+    "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.12",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.1.2",
+    "electron": "^37.2.4",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.12",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.3"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules
+dist
+dist-electron
+.output
+.vinxi
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+*.local
+.cache
+*.pt

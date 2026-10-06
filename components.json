@@ -1,0 +1,5 @@
+{
+  "style": "default",
+  "tsx": true,
+  "aliases": { "@": "./src" }
+}

@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+/*
+ * Studio design system — dark NLE editor.
+ * Colours are oklch tokens defined once in @theme inline; components never
+ * hardcode a colour.
+ */
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-panel: var(--panel);
+  --color-panel-raised: var(--panel-raised);
+  --color-rail: var(--rail);
+  --color-track: var(--track);
+  --color-clip-video: var(--clip-video);
+  --color-clip-audio: var(--clip-audio);
+  --color-clip-text: var(--clip-text);
+  --color-clip-overlay: var(--clip-overlay);
+  --color-playhead: var(--playhead);
+  --color-snap: var(--snap);
+}
+
+:root {
+  --radius: 0.5rem;
+
+  --background: oklch(0.16 0.012 265);
+  --foreground: oklch(0.95 0.006 265);
+  --card: oklch(0.21 0.014 265);
+  --card-foreground: oklch(0.95 0.006 265);
+  --popover: oklch(0.21 0.014 265);
+  --popover-foreground: oklch(0.95 0.006 265);
+
+  --primary: oklch(0.68 0.15 245);
+  --primary-foreground: oklch(0.14 0.02 265);
+  --secondary: oklch(0.26 0.015 265);
+  --secondary-foreground: oklch(0.94 0.006 265);
+  --muted: oklch(0.26 0.014 265);
+  --muted-foreground: oklch(0.66 0.014 265);
+  --accent: oklch(0.3 0.03 245);
+  --accent-foreground: oklch(0.96 0.006 265);
+
+  --destructive: oklch(0.6 0.2 25);
+  --destructive-foreground: oklch(0.98 0 0);
+
+  --border: oklch(0.3 0.014 265);
+  --input: oklch(0.34 0.016 265);
+  --ring: oklch(0.68 0.15 245);
+
+  /* editor surfaces */
+  --panel: oklch(0.195 0.013 265);
+  --panel-raised: oklch(0.235 0.014 265);
+  --rail: oklch(0.17 0.012 265);
+  --track: oklch(0.215 0.013 265);
+
+  --clip-video: oklch(0.6 0.14 250);
+  --clip-audio: oklch(0.55 0.14 155);
+  --clip-text: oklch(0.68 0.14 65);
+  --clip-overlay: oklch(0.6 0.15 320);
+  --playhead: oklch(0.62 0.22 25);
+  --snap: oklch(0.72 0.16 85);
+
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    overscroll-behavior: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Electron windows get native selection of panel text; the editor is mostly drag-based. */
+  select,
+  button {
+    font: inherit;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--rail);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--panel-raised);
+    border-radius: 999px;
+    border: 2px solid var(--rail);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--muted);
+  }
+}
+
+@utility checkerboard {
+  background-image:
+    linear-gradient(45deg, var(--rail) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--rail) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--rail) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--rail) 75%);
+  background-size: 20px 20px;
+  background-position:
+    0 0,
+    0 10px,
+    10px -10px,
+    -10px 0px;
+}
