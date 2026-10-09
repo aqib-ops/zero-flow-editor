@@ -87,11 +87,13 @@ export function ClipInspector() {
   }
 
   const change = <K extends keyof Clip>(key: K, value: Clip[K]) => updateClip(clip.id, { [key]: value });
-  const asset = state.assets.find((a) => a.id === clip.assetId);
+  // Imported overlays keep their media id on the overlay source, not on
+  // `clip.assetId`, so resolve both shapes here.
   const overlayAsset =
     clip.overlay && clip.overlay.type !== "builtin"
       ? state.assets.find((a) => a.id === (clip.overlay as { assetId: string }).assetId)
       : undefined;
+  const asset = state.assets.find((a) => a.id === clip.assetId) ?? overlayAsset;
   const clipEnd = clip.start + clip.duration;
 
   const copyTimecode = async () => {
@@ -358,7 +360,7 @@ export function ClipInspector() {
         variant="destructive"
         size="sm"
         className="mt-auto"
-        onClick={() => removeClips([clip.id])}
+        onClick={() => removeClips([clip.id], false)}
       >
         <Trash2 className="size-4" /> Delete clip
       </Button>

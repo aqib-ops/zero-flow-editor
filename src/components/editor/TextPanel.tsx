@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { CAPTION_STYLES, TEXT_ANCHORS } from "@/lib/editor/styles";
 import { makeClip, useEditor } from "@/lib/editor/store";
 import { chunkCaption } from "@/lib/editor/script";
+import { CAPTIONS_MODELS, getCaptionsModel } from "@/lib/editor/captions";
 import { projectDuration } from "@/lib/editor/render";
 import type { TextAnchor, TransitionKind } from "@/lib/editor/types";
 
@@ -38,6 +39,12 @@ export function TextPanel() {
   const textTrack = state.tracks.find((t) => t.kind === "text");
   const total = projectDuration(state.clips);
   const captionCount = state.clips.filter((c) => c.kind === "text").length;
+
+  // Read live from Settings → Captions. Not reactive, but every render after a
+  // settings change picks the new value up, which is close enough for a label.
+  const modelId = getCaptionsModel();
+  const modelLabel =
+    CAPTIONS_MODELS.find((m) => m.id === modelId)?.label ?? modelId;
 
   const applyMotionToTimeline = (newMotion: TransitionKind) => {
     setMotion(newMotion);
@@ -97,7 +104,8 @@ export function TextPanel() {
   };
 
   /**
-   * Automatically transcribes the main timeline audio using local Whisper Tiny model.
+   * Automatically transcribes the timeline audio with the local faster-whisper
+   * runtime, using whichever model size is selected in Settings → Captions.
    */
   const autoTranscribeWithWhisper = async () => {
     if (transcribing) return;
@@ -120,14 +128,16 @@ export function TextPanel() {
     }
 
     setTranscribing(true);
-    const toastId = toast.loading(`Transcribing "${targetAsset.name}" with local Whisper Tiny…`);
+    const toastId = toast.loading(
+      `Transcribing "${targetAsset.name}" with local Whisper ${modelLabel}…`,
+    );
 
     try {
       if (!window.zf?.whisper?.transcribe) {
         throw new Error("Local Whisper bridge not ready. Please restart the app.");
       }
 
-      const res = await window.zf.whisper.transcribe(targetAsset.path, "tiny");
+      const res = await window.zf.whisper.transcribe(targetAsset.path, modelId);
 
       if (!res.ok || !res.segments || res.segments.length === 0) {
         throw new Error(res.error || "No speech detected in this media file.");
@@ -173,7 +183,7 @@ export function TextPanel() {
       if (generatedClips.length > 0) {
         addClips(generatedClips);
         toast.success(
-          `✨ Generated ${generatedClips.length} one-line captions with Whisper Tiny!`,
+          `✨ Generated ${generatedClips.length} one-line captions with Whisper ${modelLabel}!`,
           { id: toastId },
         );
       } else {
@@ -187,8 +197,8 @@ export function TextPanel() {
   };
 
   return (
-    <div className="flex h-full flex-col gap-3">
-      {/* ⚡ Instant Local Whisper Tiny Action */}
+    <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1">
+      {/* ⚡ Instant local caption generation */}
       <div className="relative overflow-hidden rounded-xl border border-primary/40 bg-gradient-to-br from-primary/20 via-background to-panel p-3.5 shadow-lg">
         <div className="flex items-center justify-between mb-1.5">
           <span className="flex items-center gap-1.5 text-xs font-bold text-primary">
@@ -196,7 +206,7 @@ export function TextPanel() {
             AI Auto-Captions
           </span>
           <span className="rounded-full bg-primary/20 px-2 py-0.5 text-[9px] font-bold tracking-wider text-primary uppercase border border-primary/30">
-            Local Whisper Tiny
+            Local Whisper · {modelLabel}
           </span>
         </div>
         <p className="text-[11px] text-muted-foreground mb-3 leading-relaxed">
@@ -216,7 +226,7 @@ export function TextPanel() {
           ) : (
             <>
               <Zap className="size-4 mr-1.5 text-yellow-300 fill-yellow-300" />
-              Auto-Generate Captions (Whisper Tiny)
+              Auto-Generate Captions
             </>
           )}
         </Button>
@@ -536,7 +546,7 @@ export function TextPanel() {
       </div>
 
       {/* CapCut Templates Grid */}
-      <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+      <div className="pr-1">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             CapCut Caption Templates

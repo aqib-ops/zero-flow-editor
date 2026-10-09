@@ -1,60 +1,32 @@
 import { useCallback, useState } from "react";
-import { Layers, Trash2, Upload } from "lucide-react";
+import { Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { naturalCompare, assetFromPath } from "@/lib/editor/media";
+import { assetFromPath } from "@/lib/editor/media";
 import { makeClip, useEditor } from "@/lib/editor/store";
 import { projectDuration } from "@/lib/editor/render";
 import { BLEND_MODES } from "@/lib/editor/styles";
+import { cn } from "@/lib/utils";
 import type { OverlaySource } from "@/lib/editor/types";
 
 /**
  * Overlay hosting.
  *
- * Bring your own overlay videos (or PNG sequences / stills) and blend
- * them over the timeline. Each overlay becomes a real timeline clip you can
- * move, trim, retime, fade and re-blend.
+ * Overlays are imported straight onto the Overlays track — the panel only
+ * deals with clips actually placed there, never the general media library.
+ * Select one to edit its opacity and blend mode.
  */
 export function OverlayPanel() {
-  const { state, addAssets, addClips, removeClips, select } = useEditor();
+  const { state, addAssets, addClips, removeClips, select, updateClip } = useEditor();
   const [busy, setBusy] = useState(false);
-  const [defaultBlend, setDefaultBlend] = useState<GlobalCompositeOperation>("screen");
-  const [defaultOpacity, setDefaultOpacity] = useState(1);
 
   const overlayTrack = state.tracks.find((t) => t.kind === "overlay");
-  const overlayAssets = state.assets
-    .filter((a) => a.kind === "video" || a.kind === "image" || a.kind === "overlay")
-    .sort((a, b) => naturalCompare(a.name, b.name));
-
   const total = projectDuration(state.clips);
-
   const overlayClips = state.clips.filter((c) => c.kind === "overlay");
 
-  const addOverlay = useCallback(
-    (
-      source: OverlaySource,
-      name: string,
-      duration?: number,
-      preset?: { blend?: GlobalCompositeOperation; opacity?: number },
-    ) => {
-      if (!overlayTrack) return toast.error("No overlay track available");
-      const dur = duration ?? total;
-      if (dur <= 0) return toast.error("Add clips to the timeline first");
-
-      const clip = makeClip({
-        trackId: overlayTrack.id,
-        kind: "overlay",
-        name,
-        start: 0,
-        duration: dur,
-        opacity: preset?.opacity ?? defaultOpacity,
-        blend: preset?.blend ?? defaultBlend,
-        overlay: source,
-      });
-      addClips([clip]);
-      select([clip.id]);
-    },
-    [overlayTrack, total, defaultOpacity, defaultBlend, addClips, select],
+  // The overlay clip currently edited in the Appearance section.
+  const selectedOverlay = state.clips.find(
+    (c) => c.kind === "overlay" && state.selectedClipIds.includes(c.id),
   );
 
   const importOverlays = useCallback(async () => {
@@ -68,100 +40,146 @@ export function OverlayPanel() {
         const a = await assetFromPath(p, probe);
         if (a) assets.push(a);
       }
-      if (assets.length) {
-        addAssets(assets);
-        toast.success(`Imported ${assets.length} overlay file${assets.length > 1 ? "s" : ""}`);
-      } else {
+      if (!assets.length) {
         toast.error("No supported overlay media found");
+        return;
       }
+      addAssets(assets);
+      if (!overlayTrack) {
+        toast.error("No overlay track available");
+        return;
+      }
+      // Place each imported file directly onto the overlay track.
+      const clips = assets.map((asset) => {
+        const source: OverlaySource =
+          asset.kind === "image"
+            ? { type: "image", assetId: asset.id }
+            : { type: "video", assetId: asset.id };
+        return makeClip({
+          trackId: overlayTrack.id,
+          kind: "overlay",
+          name: asset.name,
+          start: 0,
+          duration: asset.duration || total > 0 ? total : 4,
+          opacity: 1,
+          blend: "screen",
+          overlay: source,
+        });
+      });
+      addClips(clips);
+      select([clips[0]?.id].filter(Boolean) as string[]);
+      toast.success(`Imported ${assets.length} overlay file${assets.length > 1 ? "s" : ""}`);
     } finally {
       setBusy(false);
     }
-  }, [addAssets]);
+  }, [addAssets, addClips, overlayTrack, select, total]);
+
+  const setOpacity = (v: number) => {
+    if (!selectedOverlay) return;
+    updateClip(selectedOverlay.id, { opacity: Math.min(1, Math.max(0, v)) });
+  };
+
+  const setBlend = (blend: GlobalCompositeOperation) => {
+    if (!selectedOverlay) return;
+    updateClip(selectedOverlay.id, { blend });
+  };
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto pr-1">
       <section>
         <div className="mb-2 flex items-center justify-between">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Your overlays
+            Overlays
           </p>
           <Button size="sm" onClick={importOverlays} disabled={busy}>
             <Upload className="size-3.5" /> {busy ? "Reading…" : "Import"}
           </Button>
         </div>
-
-        <div className="grid grid-cols-2 gap-1.5">
-          {overlayAssets
-            .filter((a) => a.kind !== "image")
-            .map((asset) => (
-              <button
-                key={asset.id}
-                onClick={() => {
-                  const existing = overlayClips.filter(
-                    (c) => c.overlay?.type === "video" && c.overlay.assetId === asset.id,
-                  );
-                  if (existing.length) {
-                    removeClips(existing.map((c) => c.id));
-                    toast.success(`${asset.name} removed`);
-                    return;
-                  }
-                  addOverlay({ type: "video", assetId: asset.id }, asset.name, asset.duration);
-                  toast.success(`${asset.name} placed on the overlay track`);
-                }}
-                title={`${asset.path}\n${asset.width}×${asset.height}`}
-                className="flex h-16 flex-col items-start justify-center gap-0.5 rounded-md border border-border bg-rail px-2.5 text-left hover:border-primary"
-              >
-                <span className="flex w-full items-center gap-1 text-xs font-medium">
-                  <Layers className="size-3.5 shrink-0" />
-                  <span className="truncate">{asset.name}</span>
-                </span>
-                <span className="font-mono text-[10px] text-muted-foreground">
-                  video · {asset.duration.toFixed(1)}s
-                </span>
-              </button>
-            ))}
-        </div>
-
-        <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-          Import MP4/MOV overlays with alpha (transparency) or WebM with alpha. They are placed on
-          the Overlays track — drag, trim and re-blend them like any clip.
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          Import MP4/MOV/WebM with alpha (transparency), or stills. Each file is placed on the
+          Overlays track — drag, trim and re-blend them like any clip.
         </p>
       </section>
 
-      <section className="space-y-2">
+      <section className="space-y-3 rounded-md border border-border bg-panel-raised p-3">
         <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          Defaults for new overlays
+          Overlay appearance
         </p>
-        <label className="block text-xs text-muted-foreground">
-          Blend mode
-          <select
-            value={defaultBlend}
-            onChange={(e) => setDefaultBlend(e.target.value as GlobalCompositeOperation)}
-            className="mt-1 h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground"
-          >
-            {BLEND_MODES.map((b) => (
-              <option key={b} value={b}>
-                {b}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="block text-xs text-muted-foreground">
-          <span className="flex justify-between">
-            <span>Opacity</span>
-            <span className="font-mono text-foreground">{Math.round(defaultOpacity * 100)}%</span>
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
-            value={defaultOpacity}
-            onChange={(e) => setDefaultOpacity(Number(e.target.value))}
-            className="mt-1 h-1 w-full appearance-none rounded-full bg-muted accent-primary"
-          />
-        </label>
+
+        {selectedOverlay ? (
+          <>
+            <div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground">Opacity</span>
+                <span className="font-mono text-xs text-foreground">
+                  {Math.round(selectedOverlay.opacity * 100)}%
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={selectedOverlay.opacity}
+                onChange={(e) => setOpacity(Number(e.target.value))}
+                className="mt-1.5 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-primary"
+              />
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={Math.round(selectedOverlay.opacity * 100)}
+                  onChange={(e) => setOpacity(Number(e.target.value) / 100)}
+                  className="h-7 w-16 rounded-md border border-input bg-background px-2 text-right font-mono text-xs text-foreground"
+                  aria-label="Opacity percent"
+                />
+                <span className="text-[11px] text-muted-foreground">%</span>
+                <div className="ml-auto flex gap-1">
+                  {[0, 25, 50, 75, 100].map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setOpacity(p / 100)}
+                      className={cn(
+                        "rounded border px-1.5 py-0.5 font-mono text-[10px] transition-colors",
+                        Math.round(selectedOverlay.opacity * 100) === p
+                          ? "border-primary bg-primary/15 text-foreground"
+                          : "border-border bg-rail text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <span className="text-xs text-muted-foreground">Blend mode</span>
+              <div className="mt-1.5 grid grid-cols-2 gap-1">
+                {BLEND_MODES.map((b) => (
+                  <button
+                    key={b}
+                    onClick={() => setBlend(b)}
+                    className={cn(
+                      "rounded-md border px-2 py-1.5 text-left font-mono text-[11px] transition-colors",
+                      b === selectedOverlay.blend
+                        ? "border-primary bg-primary/15 text-foreground"
+                        : "border-border bg-rail text-muted-foreground hover:border-primary/60 hover:text-foreground",
+                    )}
+                  >
+                    {b}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </>
+        ) : (
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Select an overlay on the timeline to edit its opacity and blend mode here.
+          </p>
+        )}
       </section>
 
       {overlayClips.length > 0 && (
@@ -183,7 +201,7 @@ export function OverlayPanel() {
                   size="icon"
                   variant="ghost"
                   className="size-6"
-                  onClick={() => removeClips([clip.id])}
+                  onClick={() => removeClips([clip.id], false)}
                   title="Remove overlay"
                 >
                   <Trash2 className="size-3" />

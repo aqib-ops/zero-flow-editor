@@ -21,6 +21,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { cn } from "@/lib/utils";
 import { useEditor } from "@/lib/editor/store";
 import { baseName, toFileUrl } from "@/lib/editor/media";
+import { beginAxisResize, ResizeHandle, useStoredSize } from "@/lib/editor/resize";
 import { ImportPanel } from "./ImportPanel";
 import { TextPanel } from "./TextPanel";
 import { EffectsPanel } from "./EffectsPanel";
@@ -30,6 +31,7 @@ import { ClipInspector } from "./ClipInspector";
 import { Preview } from "./Preview";
 import { Timeline } from "./Timeline";
 import { ExportDialog } from "./ExportDialog";
+import { SettingsDialog } from "./SettingsDialog";
 import type { ProjectFile } from "@/lib/editor/types";
 
 const TABS = [
@@ -46,12 +48,23 @@ type TabId = (typeof TABS)[number]["id"];
 const RATIOS = ["16:9", "9:16", "1:1", "4:5", "4:3", "3:4", "21:9"] as const;
 
 /** Timeline height limits, in CSS pixels. */
-const TIMELINE_MIN = 140;
-const TIMELINE_MAX = 520;
-const DEFAULT_TIMELINE = 260;
+const TIMELINE_MIN = 120;
+const TIMELINE_DEFAULT = 260;
+
+/**
+ * The timeline is pinned to the bottom of the window, so its divider has
+ * nowhere to travel downward. The ceiling is a share of the viewport, leaving
+ * the preview at least a usable strip.
+ */
+const timelineMax = () => Math.max(TIMELINE_MIN, Math.round(window.innerHeight * 0.62));
+
+/** Side panel width limits, in CSS pixels. */
+const PANEL_MIN = 232;
+const PANEL_MAX = 560;
+const PANEL_DEFAULT = 272;
 
 const clampTimeline = (h: number) =>
-  Math.max(TIMELINE_MIN, Math.min(TIMELINE_MAX, Math.round(h)));
+  Math.max(TIMELINE_MIN, Math.min(timelineMax(), Math.round(h)));
 
 function TitleBar() {
   const [maximized, setMaximized] = useState(false);
@@ -94,36 +107,39 @@ function TitleBar() {
   );
 }
 
-/** Warns when ffmpeg is missing — the app cannot export without it. */
-function useFfmpegStatus() {
-  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
-  useEffect(() => {
-    let alive = true;
-    if (!window.zf?.ffmpeg) {
-      setStatus({ ok: false, message: "FFmpeg bridge unavailable (desktop app required)" });
-      return;
-    }
-    void window.zf.ffmpeg
-      .findBinaries()
-      .then((b) => {
-        if (!alive) return;
-        if (b.ffmpeg) setStatus({ ok: true, message: b.ffmpeg });
-        else setStatus({ ok: false, message: "FFmpeg not found" });
-      })
-      .catch(() => alive && setStatus({ ok: false, message: "FFmpeg check failed" }));
-    return () => {
-      alive = false;
-    };
-  }, []);
-  return status;
-}
-
 export function Editor() {
   const { state, setAspectRatio, loadProject } = useEditor();
   const [tab, setTab] = useState<TabId>("import");
-  const [timelineHeight, setTimelineHeight] = useState(DEFAULT_TIMELINE);
+  const [timelineHeight, setTimelineHeightRaw] = useStoredSize(
+    "zf.timelineHeight",
+    TIMELINE_DEFAULT,
+    TIMELINE_MIN,
+    100000,
+  );
+  const [panelWidth, setPanelWidth] = useStoredSize(
+    "zf.panelWidth",
+    PANEL_DEFAULT,
+    PANEL_MIN,
+    PANEL_MAX,
+  );
   const [exportOpen, setExportOpen] = useState(false);
-  const ffmpeg = useFfmpegStatus();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const setTimelineHeight = useCallback(
+    (h: number) => setTimelineHeightRaw(clampTimeline(h)),
+    [setTimelineHeightRaw],
+  );
+
+  // A window resize can push either panel past its ceiling; pull them back so
+  // the preview is never squeezed out of existence.
+  useEffect(() => {
+    const onResize = () => {
+      setTimelineHeight(timelineHeight);
+      setPanelWidth(panelWidth);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [timelineHeight, panelWidth, setTimelineHeight, setPanelWidth]);
 
   const saveProject = useCallback(async () => {
     const file: ProjectFile = {
@@ -140,6 +156,7 @@ export function Editor() {
         width: a.width,
         height: a.height,
         hasAudio: a.hasAudio,
+        thumb: a.thumb,
       })),
     };
     const saved = await window.zf?.dialog?.saveProject(file);
@@ -185,7 +202,6 @@ export function Editor() {
         <Button
           size="sm"
           onClick={() => setExportOpen(true)}
-          disabled={!ffmpeg?.ok}
           className="h-7 gap-1.5 bg-gradient-to-r from-primary to-primary/80 font-medium text-primary-foreground shadow-sm hover:opacity-90"
         >
           <Download className="size-3.5" />
@@ -193,16 +209,16 @@ export function Editor() {
         </Button>
 
         <div className="ml-auto flex items-center gap-1">
-          <span
-            className={cn(
-              "flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px]",
-              ffmpeg?.ok ? "text-muted-foreground" : "border-destructive/60 text-destructive",
-            )}
-            title={ffmpeg?.message ?? "Checking for FFmpeg…"}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2"
+            onClick={() => setSettingsOpen(true)}
+            title="Settings"
+            aria-label="Settings"
           >
-            <Settings2 className="size-3" />
-            {ffmpeg ? (ffmpeg.ok ? "FFmpeg ready" : "FFmpeg missing") : "Checking FFmpeg…"}
-          </span>
+            <Settings2 className="size-3.5" />
+          </Button>
           <Button size="sm" variant="ghost" className="h-7" onClick={openProject} title="Open project">
             <FolderOpen className="size-3.5" /> Open
           </Button>
@@ -232,7 +248,10 @@ export function Editor() {
           ))}
         </nav>
 
-        <aside className="w-[17rem] shrink-0 overflow-hidden border-r border-border bg-panel p-3 xl:w-[20rem]">
+        <aside
+          className="shrink-0 overflow-hidden border-r border-border bg-panel p-3"
+          style={{ width: panelWidth }}
+        >
           {tab === "import" && <ImportPanel />}
           {tab === "overlay" && <OverlayPanel />}
           {tab === "text" && <TextPanel />}
@@ -241,51 +260,66 @@ export function Editor() {
           {tab === "properties" && <ClipInspector />}
         </aside>
 
+        <ResizeHandle
+          axis="x"
+          label="Resize side panel"
+          onResizeStart={(e) =>
+            beginAxisResize(e, {
+              axis: "x",
+              start: panelWidth,
+              origin: e.clientX,
+              sign: 1,
+              min: PANEL_MIN,
+              max: PANEL_MAX,
+              onChange: setPanelWidth,
+            })
+          }
+          onReset={() => setPanelWidth(PANEL_DEFAULT)}
+        />
+
         <main className="flex min-h-0 min-w-0 flex-1 flex-col">
           <Preview />
         </main>
       </div>
 
-      {/* Draggable divider: drag up to give the preview more room, down to give
-          the timeline more room. The preview is flex-1 so it absorbs the rest. */}
-      <div
-        className="group relative h-1.5 shrink-0 cursor-row-resize border-y border-border bg-panel hover:bg-primary/30 active:bg-primary/50"
-        onPointerDown={(e) => {
-          e.preventDefault();
-          e.currentTarget.setPointerCapture(e.pointerId);
-          const startY = e.clientY;
-          const startH = timelineHeight;
-          const move = (ev: PointerEvent) =>
-            setTimelineHeight(clampTimeline(startH + (ev.clientY - startY)));
-          const up = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", up);
-          };
-          window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", up);
-        }}
-        onDoubleClick={() => setTimelineHeight(DEFAULT_TIMELINE)}
-        title="Drag to resize the timeline (double-click to reset)"
-      >
-        <div className="absolute top-1/2 left-1/2 h-0.5 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-border group-hover:bg-primary" />
-      </div>
+      {/* Draggable divider. The timeline is docked to the bottom of the window,
+          so the divider can only travel upward — dragging up grows the timeline.
+          sign=-1 makes the panel fill the space the divider vacates. Dragging
+          past the viewport edge still works, because the gesture is tracked on
+          window rather than the handle. */}
+      <ResizeHandle
+        axis="y"
+        label="Resize timeline"
+        onResizeStart={(e) =>
+          beginAxisResize(e, {
+            axis: "y",
+            start: timelineHeight,
+            origin: e.clientY,
+            sign: -1,
+            min: TIMELINE_MIN,
+            max: timelineMax(),
+            onChange: setTimelineHeight,
+          })
+        }
+        onReset={() => setTimelineHeight(TIMELINE_DEFAULT)}
+      />
 
-      <div className="shrink-0 border-b border-border" style={{ height: timelineHeight }}>
-        <Timeline />
+      <div className="shrink-0" style={{ height: timelineHeight }}>
+        <Timeline
+          height={timelineHeight}
+          onHeightChange={setTimelineHeight}
+          maxHeight={timelineMax()}
+          defaultHeight={TIMELINE_DEFAULT}
+        />
       </div>
-
-      {!ffmpeg?.ok && ffmpeg && (
-        <div className="border-t border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
-          FFmpeg was not found on this PC, so export is disabled. Install FFmpeg and make sure it is on
-          your PATH, then restart Zero Flow. You can still import, edit and preview.
-        </div>
-      )}
 
       <ExportDialog
         isOpen={exportOpen}
         onClose={() => setExportOpen(false)}
         state={state}
       />
+
+      <SettingsDialog isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

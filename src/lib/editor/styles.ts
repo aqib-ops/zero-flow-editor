@@ -1,4 +1,4 @@
-import type { CaptionStyle } from "./types";
+import type { BuiltinOverlayKind, CaptionStyle } from "./types";
 
 /**
  * Font stacks deliberately use fonts that ship with Windows/macOS so captions
@@ -245,7 +245,7 @@ export const BLEND_MODES: GlobalCompositeOperation[] = [
 ];
 
 export const BUILTIN_OVERLAYS: {
-  id: string;
+  id: BuiltinOverlayKind;
   label: string;
   blend: GlobalCompositeOperation;
   opacity: number;

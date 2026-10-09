@@ -4,19 +4,25 @@
  */
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  AppInfo,
   AudioTrackSpec,
   Binaries,
+  EngineStatus,
   MediaProbe,
   OpenedScript,
   RenderProgress,
+  UpdateStatus,
 } from "./preload-types.js";
 
 export type {
+  AppInfo,
   AudioTrackSpec,
   Binaries,
+  EngineStatus,
   MediaProbe,
   OpenedScript,
   RenderProgress,
+  UpdateStatus,
 };
 
 const api = {
@@ -30,12 +36,28 @@ const api = {
   whisper: {
     transcribe: (
       mediaPath: string,
-      model = "tiny",
+      model = "base",
     ): Promise<{
       ok: boolean;
       segments?: Array<{ start: number; end: number; duration: number; text: string }>;
       error?: string;
     }> => ipcRenderer.invoke("whisper:transcribe", mediaPath, model),
+  },
+
+  /** Version, engine provenance and the GitHub Releases updater. */
+  app: {
+    info: (): Promise<AppInfo> => ipcRenderer.invoke("app:info"),
+    engine: (): Promise<EngineStatus> => ipcRenderer.invoke("app:engine"),
+    updateStatus: (): Promise<UpdateStatus> => ipcRenderer.invoke("app:update-status"),
+    updateCheck: (): Promise<UpdateStatus> => ipcRenderer.invoke("app:update-check"),
+    updateDownload: (): Promise<UpdateStatus> => ipcRenderer.invoke("app:update-download"),
+    updateInstall: (): Promise<void> => ipcRenderer.invoke("app:update-install"),
+    openExternal: (url: string): Promise<void> => ipcRenderer.invoke("app:open-external", url),
+    onUpdateStatus: (cb: (s: UpdateStatus) => void): (() => void) => {
+      const h = (_: unknown, s: UpdateStatus) => cb(s);
+      ipcRenderer.on("app:update-status", h);
+      return () => ipcRenderer.off("app:update-status", h);
+    },
   },
 
   dialog: {

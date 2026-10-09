@@ -17,7 +17,7 @@ export default defineConfig({
   },
   build: {
     outDir: r("dist/renderer"),
-    emptyOutDir: false,
+    emptyOutDir: true,
     target: "chrome138",
     chunkSizeWarningLimit: 1500,
     rollupOptions: {

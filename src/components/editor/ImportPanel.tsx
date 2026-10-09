@@ -161,7 +161,7 @@ export function ImportPanel() {
     );
 
   return (
-    <div className="flex h-full flex-col gap-3">
+    <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1">
       <button
         className={cn(
           "rounded-lg border-2 border-dashed border-border p-5 text-center transition-colors cursor-pointer",
@@ -210,7 +210,7 @@ export function ImportPanel() {
         </div>
       )}
 
-      <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1">
+      <div className="space-y-1.5">
         {state.assets.map((asset) => (
           <div
             key={asset.id}

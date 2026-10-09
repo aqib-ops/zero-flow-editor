@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  getAudio,
+  getVideo,
+  isAudioAsset,
+  isVideoAsset,
+} from "@/lib/editor/media";
+import {
+  activeClips,
+  resolveClipAsset,
+} from "@/lib/editor/render";
 import {
   ChevronsLeftRight,
   Pause,
@@ -13,7 +23,14 @@ import {
 import { Button } from "@/components/ui/button";
 import { useEditor } from "@/lib/editor/store";
 import { formatTime, onMediaLoaded } from "@/lib/editor/media";
-import { projectDuration, renderFrame, syncVideoElements, syncAudioElements } from "@/lib/editor/render";
+import {
+  buildRenderScene,
+  projectDuration,
+  renderFrame,
+  syncVideoElements,
+  syncAudioElements,
+  type RenderScene,
+} from "@/lib/editor/render";
 
 /**
  * Fits the canvas inside its container at the project's aspect ratio.
@@ -71,8 +88,19 @@ export function Preview() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Build the render lookup tables once per edit instead of on every frame.
+  const scene = useMemo(
+    () => buildRenderScene(state),
+    [state.assets, state.tracks, state.clips, state.settings],
+  );
+  const sceneRef = useRef<RenderScene>(scene);
+  sceneRef.current = scene;
   const rafRef = useRef<number>(0);
   const anchorRef = useRef<{ wall: number; time: number } | null>(null);
+  /** Throttle playhead state so the whole editor doesn't re-render at 60fps. */
+  const lastUiSyncRef = useRef(0);
+  /** Debounce timer for audio scrub bursts while dragging the playhead. */
+  const scrubAudioTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showSafeArea, setShowSafeArea] = useState(false);
 
   const total = projectDuration(state.clips);
@@ -80,13 +108,13 @@ export function Preview() {
   const { width, height } = useFittedCanvas(containerRef, canvasRef, aspect);
 
   const syncAudio = useCallback((time: number, playing: boolean) => {
-    syncAudioElements(stateRef.current, time, playing);
+    syncAudioElements(sceneRef.current, time, playing);
   }, []);
 
   const draw = useCallback((time: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const s = stateRef.current;
+    const s = sceneRef.current;
     // Keep the backing store at the project resolution; CSS scales it to fit.
     if (canvas.width !== s.settings.width || canvas.height !== s.settings.height) {
       canvas.width = s.settings.width;
@@ -109,14 +137,111 @@ export function Preview() {
     }
   }, [state.settings.width, state.settings.height]);
 
-  // Redraw while paused on any state change.
+  // Scrubbing (paused, playhead changed) must show the correct frame and play
+  // a short audio burst, like Premiere Pro.
+  //
+  // Two problems with the old approach (sync → rAF → draw):
+  //   1. Video seeking is asynchronous, so the next rAF painted the OLD frame.
+  //   2. syncAudio(…, false) paused everything, so scrubbing was silent.
+  // Now we wait for `seeked` on any video element before drawing, and we let
+  // audio elements play a brief burst when the playhead lands on them.
   useEffect(() => {
     if (state.playing) return;
-    syncVideoElements(state, state.playhead, false);
-    syncAudio(state.playhead, false);
-    const id = requestAnimationFrame(() => draw(state.playhead));
-    return () => cancelAnimationFrame(id);
+    const s = sceneRef.current;
+    const time = state.playhead;
+    syncVideoElements(s, time, false);
+    syncAudio(time, false);
+
+    // Ask every active video element to seek, then draw once they've all fired
+    // `seeked`. A video still decoding (readyState < 2) can't seek yet, so
+    // it's excluded and will be drawn via the media-loaded redraw instead.
+    const seeking: HTMLVideoElement[] = [];
+    for (const clip of activeClips(s, time)) {
+      const asset = resolveClipAsset(s, clip);
+      if (!asset || !isVideoAsset(asset)) continue;
+      const el = getVideo(asset.url, `${s.mediaOwnerPrefix}${clip.id}`);
+      if (el.readyState >= 2) seeking.push(el);
+    }
+
+    let cancelled = false;
+    let pending = seeking.length;
+    let rafId = 0;
+
+    const paint = () => {
+      if (cancelled) return;
+      rafId = requestAnimationFrame(() => draw(time));
+    };
+
+    if (pending === 0) {
+      paint();
+    } else {
+      const onSeeked = () => {
+        pending -= 1;
+        if (pending === 0) paint();
+      };
+      for (const el of seeking) el.addEventListener("seeked", onSeeked);
+      // Safety net: if a seek stalls, paint anyway rather than freeze on black.
+      const timer = setTimeout(paint, 120);
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+        cancelAnimationFrame(rafId);
+        for (const el of seeking) el.removeEventListener("seeked", onSeeked);
+      };
+    }
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+    };
   }, [state, draw, syncAudio]);
+
+  // Audio scrub: while paused, play a short burst of any audio clip under the
+  // playhead so dragging across the timeline is audible (Premiere Pro style).
+  // Debounced so a drag plays one burst per pause, not one per frame.
+  useEffect(() => {
+    if (state.playing) return;
+    const s = sceneRef.current;
+    const time = state.playhead;
+
+    const playables: HTMLAudioElement[] = [];
+    for (const clip of activeClips(s, time)) {
+      if (clip.kind !== "audio") continue;
+      const asset = resolveClipAsset(s, clip);
+      if (!asset || !isAudioAsset(asset)) continue;
+      const el = getAudio(asset.url, `${s.mediaOwnerPrefix}${clip.id}`);
+      const target = clip.offset + (time - clip.start) * clip.speed;
+      if (Math.abs(el.currentTime - target) > 0.25) {
+        try {
+          el.currentTime = Math.max(0, target);
+        } catch {
+          /* seek before metadata — skip */
+        }
+      }
+      el.volume = Math.min(1, Math.max(0, clip.volume));
+      el.muted = s.tracks.get(clip.trackId)?.muted ?? false;
+      playables.push(el);
+    }
+
+    if (!playables.length) return;
+
+    for (const el of playables) {
+      void el.play().catch(() => {
+        /* autoplay blocked until first user gesture */
+      });
+    }
+
+    if (scrubAudioTimer.current) clearTimeout(scrubAudioTimer.current);
+    scrubAudioTimer.current = setTimeout(() => {
+      for (const el of playables) {
+        if (!el.paused) el.pause();
+      }
+    }, 220);
+
+    return () => {
+      if (scrubAudioTimer.current) clearTimeout(scrubAudioTimer.current);
+    };
+  }, [state.playhead, state.playing]);
 
   // When any image or video completes decoding, redraw the current frame
   useEffect(() => {
@@ -132,23 +257,30 @@ export function Preview() {
     if (!state.playing) {
       anchorRef.current = null;
       syncAudio(stateRef.current.playhead, false);
-      syncVideoElements(stateRef.current, stateRef.current.playhead, false);
+      syncVideoElements(sceneRef.current, stateRef.current.playhead, false);
       return;
     }
     anchorRef.current = { wall: performance.now(), time: stateRef.current.playhead };
+    lastUiSyncRef.current = 0;
 
     const loop = () => {
       const a = anchorRef.current;
       if (!a) return;
-      const s = stateRef.current;
+      const s = sceneRef.current;
       const dur = projectDuration(s.clips);
-      const t = a.time + (performance.now() - a.wall) / 1000;
+      const now = performance.now();
+      const t = a.time + (now - a.wall) / 1000;
       if (t >= dur) {
         setPlayhead(dur);
         setPlaying(false);
         return;
       }
-      setPlayhead(t);
+      // The canvas and media elements follow the wall clock every frame, but
+      // the React playhead only needs to move fast enough to look smooth.
+      if (now - lastUiSyncRef.current >= 33) {
+        lastUiSyncRef.current = now;
+        setPlayhead(t);
+      }
       syncVideoElements(s, t, true);
       syncAudio(t, true);
       draw(t);
@@ -173,7 +305,8 @@ export function Preview() {
       } else if (e.key === "Delete" || e.key === "Backspace") {
         if (stateRef.current.selectedClipIds.length) {
           e.preventDefault();
-          removeClips(stateRef.current.selectedClipIds);
+          // Ripple by default; Shift keeps the gap where the clip was.
+          removeClips(stateRef.current.selectedClipIds, !e.shiftKey);
         }
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
@@ -188,7 +321,7 @@ export function Preview() {
       } else if (e.key === "Home") {
         setPlayhead(0);
       } else if (e.key === "End") {
-        setPlayhead(projectDuration(stateRef.current.clips));
+        setPlayhead(projectDuration(sceneRef.current.clips));
       }
     };
     window.addEventListener("keydown", onKey);
@@ -275,7 +408,7 @@ export function Preview() {
             variant="ghost"
             onClick={() => removeClips(state.selectedClipIds)}
             disabled={state.selectedClipIds.length === 0}
-            title="Delete selection (Del)"
+            title="Ripple delete selection (Del) · Shift+Del keeps the gap"
           >
             <Trash2 className="size-4" /> Delete
           </Button>

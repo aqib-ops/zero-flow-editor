@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import {
   CheckCircle2,
   Download,
@@ -83,6 +83,17 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
     const mb = (bitrate * total) / 8 + (0.192 * total) / 8;
     return Math.max(0.1, Number(mb.toFixed(1)));
   }, [bitrate, total]);
+
+  // ESC closes the dialog — but never mid-render, since abandoning an encode
+  // is a separate, explicit decision.
+  useEffect(() => {
+    if (!isOpen || isExporting) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isOpen, isExporting, onClose]);
 
   if (!isOpen) return null;
 
@@ -169,7 +180,7 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-in fade-in duration-150">
-      <div className="relative w-full max-w-lg rounded-2xl border border-border bg-panel-raised p-6 shadow-2xl overflow-hidden">
+      <div className="relative w-full max-w-lg rounded-2xl border border-border bg-panel-raised p-6 shadow-2xl overflow-hidden animate-in pop-in">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border/80 pb-3.5 mb-4">
           <div className="flex items-center gap-2">

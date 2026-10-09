@@ -24,6 +24,28 @@ export function kindFromPath(path: string): AssetKind | null {
   return null;
 }
 
+/**
+ * Narrowing helpers used by the renderer and export pipeline. The predicates
+ * keep the `kind` literal so an `else if` chain doesn't collapse to `never`.
+ */
+export function isImageAsset(
+  asset: MediaAsset | undefined,
+): asset is MediaAsset & { kind: "image" } {
+  return asset?.kind === "image";
+}
+
+export function isVideoAsset(
+  asset: MediaAsset | undefined,
+): asset is MediaAsset & { kind: "video" } {
+  return asset?.kind === "video";
+}
+
+export function isAudioAsset(
+  asset: MediaAsset | undefined,
+): asset is MediaAsset & { kind: "audio" } {
+  return asset?.kind === "audio";
+}
+
 /** Sort names naturally so "clip 2" comes before "clip 10". */
 export function naturalCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
@@ -135,8 +157,8 @@ export async function assetFromPath(path: string, probe?: () => Promise<{
         try {
           const dUrl = await window.zf.media.toDataUrl(path);
           if (dUrl) finalThumb = dUrl;
-        } catch {
-          /* fallback to url */
+        } catch (error) {
+          console.warn("[media] thumbnail conversion failed, using source URL", path, error);
         }
       }
       const img = await loadImage(finalThumb || url);
@@ -153,24 +175,22 @@ export async function assetFromPath(path: string, probe?: () => Promise<{
       const nativeDur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
       const nativeW = v.videoWidth || 0;
       const nativeH = v.videoHeight || 0;
-      // Chromium exposes unreliable durations for some containers — trust ffprobe.
-      if ((!nativeDur || !nativeW) && probe) {
-        const p = await probe();
-        return {
-          ...base,
-          duration: p.duration > 0 ? p.duration : 5,
-          width: p.width || nativeW || 1920,
-          height: p.height || nativeH || 1080,
-          hasAudio: p.hasAudio,
-          thumb: videoThumb(v),
-        };
+      let probed:
+        | { duration: number; width: number; height: number; hasAudio: boolean }
+        | undefined;
+      if (probe) {
+        try {
+          probed = await probe();
+        } catch (probeError) {
+          console.warn(`[media] ffprobe metadata failed for ${base.name}`, probeError);
+        }
       }
       return {
         ...base,
-        duration: nativeDur || 5,
-        width: nativeW,
-        height: nativeH,
-        hasAudio: true,
+        duration: nativeDur || (probed?.duration && probed.duration > 0 ? probed.duration : 5),
+        width: nativeW || probed?.width || 1920,
+        height: nativeH || probed?.height || 1080,
+        hasAudio: probed?.hasAudio ?? false,
         thumb: videoThumb(v),
       };
     }
@@ -181,17 +201,22 @@ export async function assetFromPath(path: string, probe?: () => Promise<{
       return { ...base, duration: p.duration > 0 ? p.duration : 10, hasAudio: p.hasAudio };
     }
     return { ...base, duration: dur || 10, hasAudio: true };
-  } catch {
+  } catch (error) {
+    console.warn(`[media] browser decode failed for ${base.name}`, error);
     // Undecodable in the renderer — ffprobe may still salvage the metadata.
     if (probe) {
-      const p = await probe();
-      return {
-        ...base,
-        duration: p.duration || 5,
-        width: p.width || 1920,
-        height: p.height || 1080,
-        hasAudio: p.hasAudio,
-      };
+      try {
+        const p = await probe();
+        return {
+          ...base,
+          duration: p.duration || 5,
+          width: p.width || 1920,
+          height: p.height || 1080,
+          hasAudio: p.hasAudio,
+        };
+      } catch (probeError) {
+        console.error(`[media] ffprobe fallback failed for ${base.name}`, probeError);
+      }
     }
     return null;
   }
@@ -229,54 +254,94 @@ export function getImage(url: string): HTMLImageElement {
     el = new Image();
     el.crossOrigin = "anonymous";
     el.onload = () => notifyMediaLoaded();
+    el.onerror = () => console.warn("[media] image failed to load", url);
     el.src = url;
     imageCache.set(url, el);
   }
   return el;
 }
 
-export function getVideo(url: string): HTMLVideoElement {
-  let el = videoCache.get(url);
+/**
+ * Wait until a cached image has decoded enough to be drawn. Export uses this
+ * before compositing a frame so an image overlay can never be skipped just
+ * because its decode completed after the frame render began.
+ */
+export function waitForImage(url: string, timeoutMs = 15_000): Promise<HTMLImageElement> {
+  const image = getImage(url);
+  if (image.complete && image.naturalWidth > 0) return Promise.resolve(image);
+
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      image.removeEventListener("load", onLoad);
+      image.removeEventListener("error", onError);
+      if (error) reject(error);
+      else resolve(image);
+    };
+    const onLoad = () => finish();
+    const onError = () => finish(new Error(`Could not decode image: ${url}`));
+    const timer = setTimeout(
+      () => finish(new Error(`Timed out waiting for image: ${url}`)),
+      timeoutMs,
+    );
+
+    image.addEventListener("load", onLoad);
+    image.addEventListener("error", onError);
+    // The image may have completed between the initial check and listener
+    // registration.
+    if (image.complete) onLoad();
+  });
+}
+
+export function getVideo(url: string, owner = "shared"): HTMLVideoElement {
+  const key = `${url}\0${owner}`;
+  let el = videoCache.get(key);
   if (!el) {
     el = document.createElement("video");
     el.src = url;
     el.preload = "auto";
-    el.muted = true;
     el.playsInline = true;
     el.crossOrigin = "anonymous";
     el.onloadeddata = () => notifyMediaLoaded();
     el.onseeked = () => notifyMediaLoaded();
-    videoCache.set(url, el);
+    el.onerror = () => console.warn("[media] video failed to load", url);
+    videoCache.set(key, el);
   }
   return el;
 }
 
-export function getAudio(url: string): HTMLAudioElement {
-  let el = audioCache.get(url);
+export function getAudio(url: string, owner = "shared"): HTMLAudioElement {
+  const key = `${url}\0${owner}`;
+  let el = audioCache.get(key);
   if (!el) {
     el = new Audio(url);
     el.preload = "auto";
     el.crossOrigin = "anonymous";
-    audioCache.set(url, el);
+    el.onerror = () => console.warn("[media] audio failed to load", url);
+    audioCache.set(key, el);
   }
   return el;
 }
 
 export function releaseAsset(url: string): void {
   imageCache.delete(url);
-  const v = videoCache.get(url);
-  if (v) {
-    v.pause();
-    v.removeAttribute("src");
-    v.load();
-    videoCache.delete(url);
+  const prefix = `${url}\0`;
+  for (const [key, video] of videoCache) {
+    if (!key.startsWith(prefix)) continue;
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    videoCache.delete(key);
   }
-  const a = audioCache.get(url);
-  if (a) {
-    a.pause();
-    a.removeAttribute("src");
-    a.load();
-    audioCache.delete(url);
+  for (const [key, audio] of audioCache) {
+    if (!key.startsWith(prefix)) continue;
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    audioCache.delete(key);
   }
 }
 

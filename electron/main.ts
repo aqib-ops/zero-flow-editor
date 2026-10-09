@@ -10,6 +10,14 @@ import {
   cancelRender,
   isRendering,
 } from "./ffmpeg.js";
+import { findWhisperRuntime, DEFAULT_MODEL } from "./whisper.js";
+import {
+  checkForUpdates,
+  currentUpdateStatus,
+  downloadUpdate,
+  quitAndInstall,
+  startAutoUpdates,
+} from "./updater.js";
 import type { AudioTrackSpec, RenderProgress } from "./preload-types.js";
 
 export type { AudioTrackSpec, RenderProgress };
@@ -111,6 +119,9 @@ app.whenReady().then(() => {
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+
+  // Silent background check so Settings → Updates has a state on first open.
+  startAutoUpdates(send);
 });
 
 app.on("window-all-closed", () => {
@@ -156,6 +167,44 @@ ipcMain.handle("ff:find-binaries", () => findBinaries());
 
 ipcMain.handle("ff:probe", (_e, path: string) => probeMedia(path));
 
+/* ------------------------------ app / settings ------------------------------ */
+
+ipcMain.handle("app:info", () => ({
+  name: app.getName(),
+  version: app.getVersion(),
+  electron: process.versions.electron ?? "",
+  chrome: process.versions.chrome ?? "",
+  node: process.versions.node ?? "",
+  platform: `${process.platform} ${process.arch}`,
+  packaged: app.isPackaged,
+  repo: "https://github.com/aqib-ops/zero-flow-editor",
+}));
+
+ipcMain.handle("app:engine", async () => {
+  const binaries = await findBinaries();
+  const runtime = findWhisperRuntime();
+  const modelDir = runtime ? join(runtime.modelRoot, DEFAULT_MODEL) : null;
+  const modelReady = !!modelDir && existsSync(join(modelDir, "model.bin"));
+  return {
+    ffmpeg: { path: binaries.ffmpeg, source: binaries.source },
+    captions: {
+      available: !!runtime && modelReady,
+      python: runtime?.python ?? null,
+      source: runtime?.source ?? null,
+      modelRoot: modelReady ? modelDir : null,
+    },
+  };
+});
+
+ipcMain.handle("app:update-status", () => currentUpdateStatus());
+ipcMain.handle("app:update-check", () => checkForUpdates(send));
+ipcMain.handle("app:update-download", () => downloadUpdate(send));
+ipcMain.handle("app:update-install", () => quitAndInstall());
+ipcMain.handle("app:open-external", (_e, url: string) => {
+  // Only ever hand http(s) to the OS browser.
+  if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+});
+
 ipcMain.handle("dlg:open-media", async () => {
   const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
   if (!win) return [];
@@ -190,13 +239,24 @@ ipcMain.handle("dlg:open-script", async () => {
   return { path: p, text: readFileSync(p, "utf8") };
 });
 
-ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model = "tiny") => {
+ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model?: string) => {
   if (!mediaPath || !existsSync(mediaPath)) {
     return { ok: false, error: `Media file not found: ${mediaPath}` };
   }
+
+  const runtime = findWhisperRuntime();
+  if (!runtime) {
+    return {
+      ok: false,
+      error:
+        "The captioning engine is not installed. Run `npm run setup:whisper` once, or reinstall the app.",
+    };
+  }
+
+  const modelSize = model && model !== "auto" ? model : DEFAULT_MODEL;
+
   return new Promise((resolve) => {
-    const scriptPath = join(__dirname, "../scripts/transcribe.py");
-    const py = spawn("python", [scriptPath, mediaPath, model], {
+    const py = spawn(runtime.python, [runtime.script, mediaPath, modelSize, runtime.modelRoot], {
       windowsHide: true,
     });
     let stdout = "";
@@ -232,7 +292,10 @@ ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model = "tiny
     });
 
     py.on("error", (err) => {
-      resolve({ ok: false, error: `Failed to execute python: ${err.message}` });
+      resolve({
+        ok: false,
+        error: `Failed to launch the captioning engine (${runtime.python}): ${err.message}`,
+      });
     });
   });
 });

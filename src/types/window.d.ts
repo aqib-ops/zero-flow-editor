@@ -8,7 +8,7 @@
 export interface Binaries {
   ffmpeg: string | null;
   ffprobe: string | null;
-  source: "PATH" | "found" | "missing";
+  source: "PATH" | "found" | "missing" | "bundled";
 }
 
 export interface MediaProbe {
@@ -43,6 +43,53 @@ export interface OpenedScript {
   text: string;
 }
 
+/** Everything the About tab shows, plus what the UI branches on. */
+export interface AppInfo {
+  name: string;
+  version: string;
+  electron: string;
+  chrome: string;
+  node: string;
+  platform: string;
+  packaged: boolean;
+  repo: string;
+}
+
+/** Where each local engine came from — Settings → General displays this. */
+export interface EngineStatus {
+  ffmpeg: {
+    path: string | null;
+    /** "bundled" means shipped inside resources/, never on the user's PATH. */
+    source: Binaries["source"];
+  };
+  captions: {
+    available: boolean;
+    python: string | null;
+    source: "bundled" | "system" | null;
+    /** Local model folder that was resolved, or null when only a size is set. */
+    modelRoot: string | null;
+  };
+}
+
+export type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "not-available"
+  | "available"
+  | "downloading"
+  | "downloaded"
+  | "error";
+
+export interface UpdateStatus {
+  phase: UpdatePhase;
+  /** Next version once an update is found / downloaded. */
+  version?: string;
+  releaseDate?: string;
+  /** 0–100 while downloading. */
+  percent?: number;
+  message?: string;
+}
+
 export interface ZfApi {
   ffmpeg: {
     findBinaries: () => Promise<Binaries>;
@@ -57,6 +104,17 @@ export interface ZfApi {
       segments?: Array<{ start: number; end: number; duration: number; text: string }>;
       error?: string;
     }>;
+  };
+  /** Version info, engine provenance and the GitHub Releases updater. */
+  app: {
+    info: () => Promise<AppInfo>;
+    engine: () => Promise<EngineStatus>;
+    updateStatus: () => Promise<UpdateStatus>;
+    updateCheck: () => Promise<UpdateStatus>;
+    updateDownload: () => Promise<UpdateStatus>;
+    updateInstall: () => Promise<void>;
+    openExternal: (url: string) => Promise<void>;
+    onUpdateStatus: (cb: (s: UpdateStatus) => void) => () => void;
   };
   dialog: {
     openMedia: () => Promise<string[]>;

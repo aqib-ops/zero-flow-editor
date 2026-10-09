@@ -1,9 +1,13 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronsLeftRight,
+  ChevronsUpDown,
   Eye,
   EyeOff,
   Lock,
   Magnet,
+  Maximize2,
+  Minus,
   Plus,
   Unlock,
   Volume2,
@@ -18,7 +22,8 @@ import { baseName, formatTime } from "@/lib/editor/media";
 import { clipEnd, projectDuration } from "@/lib/editor/render";
 import { overlayKey } from "@/lib/editor/store";
 import { BUILTIN_OVERLAYS } from "@/lib/editor/styles";
-import type { Clip, Track, TrackKind } from "@/lib/editor/types";
+import { useAudioWaveform } from "@/lib/editor/waveform";
+import type { Clip, MediaAsset, Track, TrackKind } from "@/lib/editor/types";
 
 const HEADER_W = 148;
 const ROW_H = 56;
@@ -36,6 +41,16 @@ interface DragState {
   originDuration: number;
   originOffset: number;
   originTrack: string;
+  /** Every selected clip captured at pointer-down for a group move. */
+  group: DragClipOrigin[];
+}
+
+interface DragClipOrigin {
+  id: string;
+  kind: TrackKind;
+  start: number;
+  duration: number;
+  trackId: string;
 }
 
 const clipColor: Record<TrackKind, string> = {
@@ -53,8 +68,30 @@ function overlayLabel(clip: Clip): string {
   return clip.name;
 }
 
-export function Timeline() {
-  const { state, update, updateClip, moveClip, select, setPlayhead, addTrack, addClips } = useEditor();
+interface TimelineProps {
+  /** Current height in CSS pixels, owned by the editor shell. */
+  height: number;
+  /** Commits a new height (already clamped by the shell). */
+  onHeightChange: (height: number) => void;
+  /** Upper bound, used for the expand/collapse presets. */
+  maxHeight: number;
+  /** Value restored by the reset preset. */
+  defaultHeight: number;
+}
+
+export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: TimelineProps) {
+  const {
+    state,
+    update,
+    updateClip,
+    applyClipPatches,
+    beginGesture,
+    endGesture,
+    select,
+    setPlayhead,
+    addTrack,
+    addClips,
+  } = useEditor();
   const scrollRef = useRef<HTMLDivElement>(null);
   const laneRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -65,13 +102,16 @@ export function Timeline() {
   const zoom = state.zoom;
   const total = Math.max(projectDuration(state.clips), 10);
   const contentWidth = (total + 8) * zoom;
+  const assetMap = useMemo(() => new Map(state.assets.map((a) => [a.id, a])), [state.assets]);
 
   const timeFromClientX = useCallback(
     (clientX: number) => {
       const lane = laneRef.current;
       if (!lane) return 0;
       const rect = lane.getBoundingClientRect();
-      return Math.max(0, (clientX - rect.left) / zoom);
+      // laneRef spans the full width including the pinned header column, so
+      // time=0 sits HEADER_W pixels in from its left edge.
+      return Math.max(0, (clientX - rect.left - HEADER_W) / zoom);
     },
     [zoom],
   );
@@ -90,7 +130,7 @@ export function Timeline() {
    * Returns the snapped value plus the guide line to draw.
    */
   const applySnap = useCallback(
-    (time: number, ignoreId?: string) => {
+    (time: number, ignoreIds?: readonly string[]) => {
       if (!state.snap) return { time, guide: null as number | null };
       const tol = SNAP_PX / zoom;
       let best: number | null = null;
@@ -98,7 +138,9 @@ export function Timeline() {
       const pts = [
         0,
         state.playhead,
-        ...state.clips.filter((c) => c.id !== ignoreId).flatMap((c) => [c.start, clipEnd(c)]),
+        ...state.clips
+          .filter((c) => !ignoreIds?.includes(c.id))
+          .flatMap((c) => [c.start, clipEnd(c)]),
       ];
       for (const p of pts) {
         const d = Math.abs(p - time);
@@ -137,6 +179,47 @@ export function Timeline() {
     if (state.tracks.find((t) => t.id === clip.trackId)?.locked) return;
     e.stopPropagation();
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
+
+    const alreadySelected = state.selectedClipIds.includes(clip.id);
+    let selection = state.selectedClipIds;
+    if (mode === "move" && e.shiftKey) {
+      // Shift-click toggles membership. Adding extends the drag group;
+      // removing means there is nothing to move.
+      selection = alreadySelected
+        ? state.selectedClipIds.filter((id) => id !== clip.id)
+        : [...state.selectedClipIds, clip.id];
+      select(selection);
+      if (alreadySelected) return;
+    } else if (!alreadySelected) {
+      // Clicking an unselected clip selects just it; clicking an already
+      // selected clip keeps the group so it can be dragged together.
+      selection = [clip.id];
+      select([clip.id]);
+    }
+
+    const group: DragClipOrigin[] =
+      mode === "move"
+        ? state.clips
+            .filter((c) => selection.includes(c.id))
+            .filter((c) => !state.tracks.find((t) => t.id === c.trackId)?.locked)
+            .map((c) => ({
+              id: c.id,
+              kind: c.kind,
+              start: c.start,
+              duration: c.duration,
+              trackId: c.trackId,
+            }))
+        : [
+            {
+              id: clip.id,
+              kind: clip.kind,
+              start: clip.start,
+              duration: clip.duration,
+              trackId: clip.trackId,
+            },
+          ];
+
+    beginGesture();
     dragRef.current = {
       mode,
       clipId: clip.id,
@@ -146,44 +229,82 @@ export function Timeline() {
       originDuration: clip.duration,
       originOffset: clip.offset,
       originTrack: clip.trackId,
+      group: group.length ? group : [
+        {
+          id: clip.id,
+          kind: clip.kind,
+          start: clip.start,
+          duration: clip.duration,
+          trackId: clip.trackId,
+        },
+      ],
     };
-    if (!state.selectedClipIds.includes(clip.id)) select([clip.id]);
   };
 
   const onLaneMove = (e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
     const dx = (e.clientX - d.startX) / zoom;
+    const dy = e.clientY - d.startY;
     const clip = state.clips.find((c) => c.id === d.clipId);
     if (!clip) return;
+    const groupIds = d.group.map((g) => g.id);
 
     if (d.mode === "move") {
-      // Snap either edge, whichever is closer to a snap point.
-      const raw = Math.max(0, d.originStart + dx);
-      const snappedStart = applySnap(raw, clip.id);
-      const snappedEnd = applySnap(raw + d.originDuration, clip.id);
+      // Snap the group's leading and trailing edges, then move every clip by
+      // the same time delta so their relative spacing is preserved.
+      const groupStart = Math.min(...d.group.map((g) => g.start));
+      const groupEnd = Math.max(...d.group.map((g) => g.start + g.duration));
+      const span = groupEnd - groupStart;
+      const raw = Math.max(0, groupStart + dx);
+      const snappedStart = applySnap(raw, groupIds);
+      const snappedEnd = applySnap(raw + span, groupIds);
       let newStart = raw;
       let guide: number | null = null;
       if (snappedStart.guide !== null) {
         newStart = snappedStart.time;
         guide = snappedStart.guide;
       } else if (snappedEnd.guide !== null) {
-        newStart = snappedEnd.time - d.originDuration;
+        newStart = snappedEnd.time - span;
         guide = snappedEnd.guide;
       }
       setSnapLine(guide);
+      const delta = newStart - groupStart;
 
-      // Vertical track change, restricted to tracks of the same kind.
-      const rows = state.tracks;
-      const rowIdx = Math.max(0, rows.findIndex((t) => t.id === d.originTrack));
-      const delta = Math.round((e.clientY - d.startY) / ROW_H);
-      const target = rows[Math.min(rows.length - 1, Math.max(0, rowIdx + delta))];
-      const trackId = target && target.kind === clip.kind && !target.locked ? target.id : clip.trackId;
+      // Vertical movement shifts each selected clip by the same number of
+      // compatible track rows, but only if every clip has a valid target.
+      const rowDelta = Math.round(dy / ROW_H);
+      const trackFor = new Map<string, string>();
+      if (rowDelta !== 0) {
+        let valid = true;
+        for (const origin of d.group) {
+          const compatible = state.tracks.filter(
+            (t) => t.kind === origin.kind && !t.locked,
+          );
+          const currentIndex = compatible.findIndex((t) => t.id === origin.trackId);
+          const nextIndex = currentIndex + rowDelta;
+          if (currentIndex < 0 || nextIndex < 0 || nextIndex >= compatible.length) {
+            valid = false;
+            break;
+          }
+          trackFor.set(origin.id, compatible[nextIndex].id);
+        }
+        if (!valid) trackFor.clear();
+      }
 
-      moveClip(clip.id, newStart, trackId);
+      applyClipPatches(
+        d.group.map((origin) => ({
+          id: origin.id,
+          patch: {
+            start: Math.max(0, origin.start + delta),
+            trackId: trackFor.get(origin.id) ?? origin.trackId,
+          },
+        })),
+        false,
+      );
     } else if (d.mode === "trim-start") {
       const raw = Math.max(0, d.originStart + dx);
-      const { time, guide } = applySnap(raw, clip.id);
+      const { time, guide } = applySnap(raw, [clip.id]);
       setSnapLine(guide);
       const maxStart = d.originStart + d.originDuration - TRIM_MIN;
       const start = Math.min(time, maxStart);
@@ -192,18 +313,20 @@ export function Timeline() {
         start,
         duration: d.originDuration - delta,
         offset: Math.max(0, d.originOffset + delta * clip.speed),
-      });
+      }, false);
     } else if (d.mode === "trim-end") {
       const raw = d.originStart + d.originDuration + dx;
-      const { time, guide } = applySnap(raw, clip.id);
+      const { time, guide } = applySnap(raw, [clip.id]);
       setSnapLine(guide);
-      updateClip(clip.id, { duration: Math.max(TRIM_MIN, time - d.originStart) });
+      updateClip(clip.id, { duration: Math.max(TRIM_MIN, time - d.originStart) }, false);
     }
   };
 
-  const endDrag = () => {
+  const endDrag = (commit: boolean) => {
+    if (!dragRef.current) return;
     dragRef.current = null;
     setSnapLine(null);
+    endGesture(commit);
   };
 
   /* --------------------------- drop from library --------------------------- */
@@ -240,6 +363,22 @@ export function Timeline() {
   };
 
   const rows = state.tracks;
+
+  // Auto-scroll during playback so the playhead never leaves the visible area.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !state.playing) return;
+    const playheadX = HEADER_W + state.playhead * zoom;
+    const viewLeft = el.scrollLeft;
+    const viewRight = viewLeft + el.clientWidth;
+    const margin = 48;
+    if (playheadX > viewRight - margin) {
+      el.scrollLeft = playheadX - el.clientWidth * 0.3;
+    } else if (playheadX < viewLeft + margin) {
+      el.scrollLeft = Math.max(0, playheadX - el.clientWidth * 0.3);
+    }
+  }, [state.playhead, state.playing, zoom]);
+
   const overlayIdentities = useMemo(() => {
     const m = new Map<string, string>();
     for (const c of state.clips) if (c.kind === "overlay" && c.overlay) m.set(c.id, overlayKey(c.overlay));
@@ -289,6 +428,51 @@ export function Timeline() {
         >
           <Magnet className="size-3.5" /> Snap
         </Button>
+
+        {/* Height presets: the divider only travels upward, so give the user
+            one-tap targets instead of requiring a precise edge drag. */}
+        <div className="ml-1 flex items-center gap-1 border-l border-border pl-2">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-7"
+            onClick={() => onHeightChange(Math.round(maxHeight * 0.5))}
+            disabled={height <= Math.round(maxHeight * 0.5) + 2}
+            title="Expand timeline to half height"
+          >
+            <ChevronsUpDown className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-7"
+            onClick={() => onHeightChange(maxHeight)}
+            disabled={height >= maxHeight - 2}
+            title="Maximise timeline"
+          >
+            <Maximize2 className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-7"
+            onClick={() => onHeightChange(defaultHeight)}
+            disabled={height === defaultHeight}
+            title="Reset timeline height"
+          >
+            <Minus className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-7"
+            onClick={() => onHeightChange(Math.round(maxHeight * 0.25))}
+            disabled={height <= Math.round(maxHeight * 0.25) + 2}
+            title="Collapse timeline"
+          >
+            <ChevronsLeftRight className="size-3.5 -rotate-90" />
+          </Button>
+        </div>
         <div className="ml-auto flex items-center gap-1">
           {snapPoints.length > 1 && (
             <span className="mr-1 hidden text-[10px] text-muted-foreground lg:inline">
@@ -324,7 +508,10 @@ export function Timeline() {
         <div className="relative" style={{ width: HEADER_W + contentWidth }}>
           {/* ruler */}
           <div className="sticky top-0 z-20 flex bg-rail">
-            <div className="shrink-0 border-r border-border bg-rail" style={{ width: HEADER_W }} />
+            <div
+              className="sticky left-0 z-30 shrink-0 border-r border-border bg-rail"
+              style={{ width: HEADER_W }}
+            />
             <div
               className="relative h-7 cursor-ew-resize select-none"
               style={{ width: contentWidth }}
@@ -334,6 +521,13 @@ export function Timeline() {
               onPointerCancel={onRulerUp}
             >
               <Ruler zoom={zoom} width={contentWidth} />
+              {/* playhead head lives in the sticky ruler so it never scrolls away */}
+              <div
+                className="pointer-events-none absolute top-0 z-40"
+                style={{ left: state.playhead * zoom }}
+              >
+                <div className="-ml-1.5 size-3 rotate-45 bg-playhead" />
+              </div>
             </div>
           </div>
 
@@ -341,29 +535,16 @@ export function Timeline() {
           <div
             className="relative"
             ref={laneRef}
-            style={{ marginLeft: HEADER_W }}
             onPointerMove={onLaneMove}
-            onPointerUp={endDrag}
-            onPointerLeave={endDrag}
-            onPointerCancel={endDrag}
+            onPointerUp={() => endDrag(true)}
+            onPointerCancel={() => endDrag(false)}
           >
             {rows.map((track) => (
-              <div
-                key={track.id}
-                className={cn(
-                  "relative border-b border-border bg-track",
-                  track.locked && "opacity-70",
-                )}
-                style={{ height: ROW_H }}
-                onDragOver={(e) => onDragOver(e, track)}
-                onDragLeave={() => setDropHint(null)}
-                onDrop={(e) => onDrop(e, track)}
-                onPointerDown={() => select([])}
-              >
-                {/* track header */}
+              <div key={track.id} className="flex" style={{ height: ROW_H }}>
+                {/* track header — pinned left so it never scrolls away */}
                 <div
-                  className="absolute top-0 z-10 flex h-full items-center gap-1 border-r border-border bg-panel-raised px-2"
-                  style={{ width: HEADER_W, left: -HEADER_W }}
+                  className="sticky left-0 z-10 flex shrink-0 items-center gap-1 border-r border-border bg-panel-raised px-2"
+                  style={{ width: HEADER_W }}
                 >
                   <span className={cn("size-2 shrink-0 rounded-full", clipColor[track.kind])} />
                   <span className="truncate text-[11px] font-medium" title={track.name}>
@@ -418,6 +599,16 @@ export function Timeline() {
                   </div>
                 </div>
 
+                <div
+                  className={cn(
+                    "relative min-w-0 flex-1 border-b border-border bg-track",
+                    track.locked && "opacity-70",
+                  )}
+                  onDragOver={(e) => onDragOver(e, track)}
+                  onDragLeave={() => setDropHint(null)}
+                  onDrop={(e) => onDrop(e, track)}
+                  onPointerDown={() => select([])}
+                >
                 {/* clips */}
                 {state.clips
                   .filter((c) => c.trackId === track.id)
@@ -440,6 +631,11 @@ export function Timeline() {
                                 state.assets.find((a) => a.id === clip.assetId)?.path ?? clip.name,
                               )
                             : "";
+                    const clipAsset = clip.assetId ? assetMap.get(clip.assetId) : undefined;
+                    const thumbAsset =
+                      clip.kind === "overlay" && clip.overlay && clip.overlay.type !== "builtin"
+                        ? assetMap.get((clip.overlay as { assetId: string }).assetId)
+                        : clipAsset;
                     return (
                       <div
                         key={clip.id}
@@ -450,27 +646,36 @@ export function Timeline() {
                         )}
                         style={{ left: clip.start * zoom, width }}
                         onPointerDown={(e) => beginDrag(e, clip, "move")}
-                        onPointerMove={onLaneMove}
-                        onPointerUp={endDrag}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          select(e.shiftKey ? [...state.selectedClipIds, clip.id] : [clip.id]);
-                        }}
                         title={`${label} · ${formatTime(clip.start)} → ${formatTime(clipEnd(clip))}`}
                       >
+                        {thumbAsset && (thumbAsset.kind === "video" || thumbAsset.kind === "image") && (
+                          <ClipThumb asset={thumbAsset} />
+                        )}
+                        {clip.kind === "audio" && clipAsset && (
+                          <AudioWaveform
+                            url={clipAsset.url}
+                            assetDuration={clipAsset.duration}
+                            offset={clip.offset}
+                            duration={clip.duration}
+                            speed={clip.speed}
+                            widthPx={width}
+                          />
+                        )}
                         <div
                           className="absolute left-0 top-0 z-10 h-full w-2 cursor-w-resize bg-black/30 opacity-0 transition-opacity group-hover:opacity-100"
                           onPointerDown={(e) => beginDrag(e, clip, "trim-start")}
                         />
-                        <div className="pointer-events-none flex w-full min-w-0 items-center gap-1.5 px-2">
+                        <div className="pointer-events-none relative z-[2] flex w-full min-w-0 items-center gap-1.5 px-2">
                           <div className="min-w-0 flex-1">
-                            <p className="truncate font-medium text-white/95">{label}</p>
+                            <p className="truncate font-medium text-white/95 drop-shadow-[0_1px_2px_rgba(0,0,0,0.85)]">
+                              {label}
+                            </p>
                             {sub && width > 90 && (
-                              <p className="truncate font-mono text-[9px] text-white/60">{sub}</p>
+                              <p className="truncate font-mono text-[9px] text-white/70">{sub}</p>
                             )}
                           </div>
                           {width > 46 && (
-                            <span className="shrink-0 font-mono text-white/70">
+                            <span className="shrink-0 font-mono text-white/75">
                               {clip.duration.toFixed(1)}s
                             </span>
                           )}
@@ -495,31 +700,24 @@ export function Timeline() {
                     </div>
                   </div>
                 )}
+                </div>
               </div>
             ))}
 
-            {/* snap guide */}
+            {/* snap guide — offset by HEADER_W since laneRef spans the full width */}
             {snapLine !== null && (
               <div
                 className="pointer-events-none absolute top-0 z-30 h-full w-px bg-snap"
-                style={{ left: snapLine * zoom }}
+                style={{ left: HEADER_W + snapLine * zoom }}
               />
             )}
 
-            {/* playhead */}
+            {/* playhead — spans the full height of the tracks area */}
             <div
               className="pointer-events-none absolute top-0 z-30 h-full w-px bg-playhead"
-              style={{ left: state.playhead * zoom }}
+              style={{ left: HEADER_W + state.playhead * zoom }}
             />
           </div>
-        </div>
-
-        {/* playhead head in ruler */}
-        <div
-          className="pointer-events-none absolute top-0 z-40"
-          style={{ left: HEADER_W + state.playhead * zoom }}
-        >
-          <div className="-ml-1.5 size-3 rotate-45 bg-playhead" />
         </div>
       </div>
     </div>
@@ -541,5 +739,109 @@ function Ruler({ zoom, width }: { zoom: number; width: number }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Renders the visible slice of an asset's decoded peaks as vertical bars at
+ * pixel resolution. The number of bars tracks the clip's on-screen width, so
+ * the waveform stays accurate at any zoom level — one bar per pixel, each
+ * sampling the peak envelope for the audio at that position.
+ */
+function WaveformEnvelope({
+  peaks,
+  assetDuration,
+  offset,
+  duration,
+  speed,
+  widthPx,
+}: {
+  peaks: number[];
+  assetDuration: number;
+  offset: number;
+  duration: number;
+  speed: number;
+  widthPx: number;
+}) {
+  if (peaks.length < 2) return null;
+  const safeDuration = assetDuration > 0 ? assetDuration : 1;
+  const startFrac = Math.max(0, Math.min(1, offset / safeDuration));
+  const sourceSpan = Math.max(0, duration * Math.max(0.01, speed));
+  const endFrac = Math.max(startFrac, Math.min(1, (offset + sourceSpan) / safeDuration));
+
+  const bars = Math.max(1, Math.min(1200, Math.round(widthPx)));
+  const center = 50;
+  const amp = 46;
+  const top: string[] = [];
+  const bottom: string[] = [];
+  for (let i = 0; i <= bars; i++) {
+    const frac = startFrac + (i / bars) * (endFrac - startFrac);
+    const index = Math.min(peaks.length - 1, Math.max(0, Math.round(frac * (peaks.length - 1))));
+    const peak = Math.min(1, Math.max(0, peaks[index] ?? 0));
+    const h = peak * amp;
+    const x = (i / bars) * 100;
+    top.push(`${x.toFixed(2)},${(center - h).toFixed(2)}`);
+    bottom.push(`${x.toFixed(2)},${(center + h).toFixed(2)}`);
+  }
+  bottom.reverse();
+  return (
+    <svg
+      className="pointer-events-none absolute inset-0 z-0 h-full w-full text-white/70"
+      viewBox="0 0 100 100"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      <polygon points={`${top.join(" ")} ${bottom.join(" ")}`} fill="currentColor" />
+    </svg>
+  );
+}
+
+function AudioWaveform({
+  url,
+  assetDuration,
+  offset,
+  duration,
+  speed,
+  widthPx,
+}: {
+  url: string;
+  assetDuration: number;
+  offset: number;
+  duration: number;
+  speed: number;
+  widthPx: number;
+}) {
+  const peaks = useAudioWaveform(url);
+  if (!peaks) return null;
+  return (
+    <WaveformEnvelope
+      peaks={peaks}
+      assetDuration={assetDuration}
+      offset={offset}
+      duration={duration}
+      speed={speed}
+      widthPx={widthPx}
+    />
+  );
+}
+
+/**
+ * Cover-fit thumbnail for video and image clips. The captured frame (video) or
+ * the source itself (image) fills the clip body; a gradient keeps the label
+ * readable on top.
+ */
+function ClipThumb({ asset }: { asset: MediaAsset }) {
+  const src = asset.thumb || asset.url;
+  if (!src) return null;
+  return (
+    <>
+      <img
+        src={src}
+        alt=""
+        draggable={false}
+        className="pointer-events-none absolute inset-0 z-0 h-full w-full object-cover"
+      />
+      <div className="pointer-events-none absolute inset-0 z-[1] bg-gradient-to-r from-black/55 via-black/15 to-black/35" />
+    </>
   );
 }

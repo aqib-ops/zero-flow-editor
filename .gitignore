@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-electron
+release
 .output
 .vinxi
 *.log
@@ -12,3 +13,6 @@ Thumbs.db
 *.local
 .cache
 *.pt
+
+# Staged runtime binaries (produced by scripts/setup-*.mjs, never committed)
+bin/

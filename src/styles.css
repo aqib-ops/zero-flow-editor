@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./assets/fonts/fonts.css";
 
 /*
  * Studio design system — dark NLE editor.
@@ -45,44 +46,64 @@
   --color-snap: var(--snap);
 }
 
+/*
+ * Precision Graphite.
+ *
+ * The chrome is deliberately near-neutral graphite: chroma stays at 0.006–0.008
+ * so panels read as machined metal rather than "dark blue UI". Exactly one
+ * saturated colour exists in the whole system — an electric indigo (hue 268) —
+ * reserved for primary actions, focus rings and the accent state. Everything
+ * else earns attention through lightness steps alone.
+ *
+ * The timeline clip colours are exempt: they carry meaning, so each keeps its
+ * own hue and is tuned to sit at a similar perceived weight.
+ */
+
 :root {
   --radius: 0.5rem;
 
-  --background: oklch(0.16 0.012 265);
-  --foreground: oklch(0.95 0.006 265);
-  --card: oklch(0.21 0.014 265);
-  --card-foreground: oklch(0.95 0.006 265);
-  --popover: oklch(0.21 0.014 265);
-  --popover-foreground: oklch(0.95 0.006 265);
+  --font-display: "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI",
+    ui-sans-serif, system-ui, sans-serif;
 
-  --primary: oklch(0.68 0.15 245);
-  --primary-foreground: oklch(0.14 0.02 265);
-  --secondary: oklch(0.26 0.015 265);
-  --secondary-foreground: oklch(0.94 0.006 265);
-  --muted: oklch(0.26 0.014 265);
-  --muted-foreground: oklch(0.66 0.014 265);
-  --accent: oklch(0.3 0.03 245);
-  --accent-foreground: oklch(0.96 0.006 265);
+  /* graphite ladder — depth comes from lightness, never from tint */
+  --background: oklch(0.145 0.006 255);
+  --foreground: oklch(0.955 0.004 255);
+  --card: oklch(0.2 0.007 255);
+  --card-foreground: oklch(0.955 0.004 255);
+  --popover: oklch(0.2 0.007 255);
+  --popover-foreground: oklch(0.955 0.004 255);
 
-  --destructive: oklch(0.6 0.2 25);
+  /* the single accent */
+  --primary: oklch(0.67 0.16 268);
+  --primary-foreground: oklch(0.13 0.02 268);
+
+  --secondary: oklch(0.245 0.008 255);
+  --secondary-foreground: oklch(0.94 0.004 255);
+  --muted: oklch(0.245 0.007 255);
+  --muted-foreground: oklch(0.645 0.008 255);
+  --accent: oklch(0.3 0.026 268);
+  --accent-foreground: oklch(0.96 0.004 255);
+
+  --destructive: oklch(0.62 0.19 25);
   --destructive-foreground: oklch(0.98 0 0);
 
-  --border: oklch(0.3 0.014 265);
-  --input: oklch(0.34 0.016 265);
-  --ring: oklch(0.68 0.15 245);
+  --border: oklch(0.275 0.007 255);
+  --input: oklch(0.33 0.009 255);
+  --ring: oklch(0.67 0.16 268);
 
-  /* editor surfaces */
-  --panel: oklch(0.195 0.013 265);
-  --panel-raised: oklch(0.235 0.014 265);
-  --rail: oklch(0.17 0.012 265);
-  --track: oklch(0.215 0.013 265);
+  /* editor surfaces: background < rail < panel < track < panel-raised */
+  --panel: oklch(0.185 0.006 255);
+  --panel-raised: oklch(0.228 0.007 255);
+  --rail: oklch(0.165 0.006 255);
+  --track: oklch(0.205 0.007 255);
 
-  --clip-video: oklch(0.6 0.14 250);
-  --clip-audio: oklch(0.55 0.14 155);
-  --clip-text: oklch(0.68 0.14 65);
-  --clip-overlay: oklch(0.6 0.15 320);
-  --playhead: oklch(0.62 0.22 25);
-  --snap: oklch(0.72 0.16 85);
+  /* timeline semantics — kept as the only other hues in the system */
+  --clip-video: oklch(0.58 0.13 250);
+  --clip-audio: oklch(0.56 0.12 158);
+  --clip-text: oklch(0.66 0.13 70);
+  --clip-overlay: oklch(0.58 0.14 320);
+  --playhead: oklch(0.64 0.21 25);
+  --snap: oklch(0.74 0.15 88);
 
   color-scheme: dark;
 }
@@ -107,6 +128,27 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /* Headings get the variable-width display cut so titles read as engraved
+     panel labels instead of more body copy. Utilities still win. */
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.011em;
+  }
+
+  /* Machined edge: the lightest surface catches a 1px top highlight so raised
+     panels separate from the surface below without a border or a shadow.
+     Any explicit `shadow-*` utility on the same element overrides this. */
+  .bg-panel-raised {
+    box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.035);
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 45%, transparent);
+    color: var(--foreground);
+  }
+
   /* Electron windows get native selection of panel text; the editor is mostly drag-based. */
   select,
   button {
@@ -114,19 +156,61 @@
   }
 
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 9px;
+    height: 9px;
   }
   ::-webkit-scrollbar-track {
-    background: var(--rail);
+    background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: var(--panel-raised);
+    background: var(--input);
     border-radius: 999px;
-    border: 2px solid var(--rail);
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: var(--muted);
+    background: color-mix(in oklab, var(--input) 60%, var(--foreground));
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+/* Modal entrance. `animate-in fade-in` is used by both dialogs; without these
+   the classes are inert and panels just pop into existence. */
+@keyframes zf-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes zf-pop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+
+/* Tailwind's `duration-*` utility writes transition-duration, so an animated
+   element needs its own duration here or the keyframes never run. */
+@utility animate-in {
+  animation-duration: 180ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+@utility fade-in {
+  animation-name: zf-fade;
+}
+
+@utility pop-in {
+  animation-name: zf-pop;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-in {
+    animation: none !important;
   }
 }
 

@@ -1,6 +1,13 @@
 import type { AudioTrackSpec, RenderProgress } from "@/types/window";
-import { renderFrame, projectDuration } from "./render";
-import { getAudio, getVideo } from "./media";
+import {
+  buildRenderScene,
+  mediaOwnerForClip,
+  projectDuration,
+  renderFrame,
+  resolveClipAsset,
+  type RenderScene,
+} from "./render";
+import { getAudio, getVideo, waitForImage } from "./media";
 import type { EditorState } from "./types";
 
 export interface ExportSettings {
@@ -46,10 +53,12 @@ export function resolveExportSize(
  * video clips that isn't muted and actually has a track.
  */
 export function collectAudioTracks(state: EditorState): AudioTrackSpec[] {
-  const assets = new Map(state.assets.map((a) => [a.id, a]));
+  const scene = buildRenderScene(state);
   const out: AudioTrackSpec[] = [];
-  for (const clip of state.clips) {
-    const asset = clip.assetId ? assets.get(clip.assetId) : undefined;
+  for (const clip of scene.mediaClips) {
+    // Imported overlays are visual-only; their audio is intentionally not mixed.
+    if (clip.kind === "overlay") continue;
+    const asset = resolveClipAsset(scene, clip);
     if (!asset || clip.volume <= 0) continue;
     const isAudio = clip.kind === "audio";
     const isVideoAudio = clip.kind === "video" && asset.kind === "video" && asset.hasAudio;
@@ -73,21 +82,115 @@ export function collectAudioTracks(state: EditorState): AudioTrackSpec[] {
  * waiting for the seek to land. This is what makes the export deterministic
  * instead of depending on wall-clock playback.
  */
-async function seekSources(state: EditorState, time: number): Promise<void> {
-  const assets = new Map(state.assets.map((a) => [a.id, a]));
+function waitForMetadata(
+  element: HTMLMediaElement,
+  label: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  if (element.readyState >= 1) return Promise.resolve();
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      element.removeEventListener("loadedmetadata", onLoaded);
+      element.removeEventListener("error", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onLoaded = () => finish();
+    const onError = () => finish(new Error(`Could not load media: ${label}`));
+
+    element.addEventListener("loadedmetadata", onLoaded);
+    element.addEventListener("error", onError);
+    timer = setTimeout(
+      () => finish(new Error(`Timed out loading media metadata: ${label}`)),
+      timeoutMs,
+    );
+    if (element.readyState >= 1) finish();
+  });
+}
+
+function seekMediaElement(
+  element: HTMLMediaElement,
+  target: number,
+  label: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  return (async () => {
+    await waitForMetadata(element, label, timeoutMs);
+    const duration =
+      Number.isFinite(element.duration) && element.duration > 0 ? element.duration : 0;
+    const safeTarget = Math.max(
+      0,
+      duration > 0 ? Math.min(target, duration - Math.min(0.001, duration * 0.001)) : target,
+    );
+    if (Math.abs(element.currentTime - safeTarget) <= 1 / 120) return;
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        element.removeEventListener("seeked", onSeeked);
+        element.removeEventListener("error", onError);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onSeeked = () => {
+        if (Math.abs(element.currentTime - safeTarget) > 1 / 30) {
+          finish(
+            new Error(
+              `Media seek did not reach ${safeTarget.toFixed(3)}s: ${label}`,
+            ),
+          );
+          return;
+        }
+        finish();
+      };
+      const onError = () => finish(new Error(`Could not seek media: ${label}`));
+
+      element.addEventListener("seeked", onSeeked);
+      element.addEventListener("error", onError);
+      timer = setTimeout(
+        () => finish(new Error(`Timed out seeking media: ${label}`)),
+        timeoutMs,
+      );
+
+      try {
+        element.currentTime = safeTarget;
+      } catch (error) {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error(`Could not seek media: ${label}`),
+        );
+      }
+    });
+  })();
+}
+
+async function seekSources(scene: RenderScene, time: number): Promise<void> {
   const jobs: Promise<void>[] = [];
 
-  for (const clip of state.clips) {
-    const asset = clip.assetId ? assets.get(clip.assetId) : undefined;
+  for (const clip of scene.mediaClips) {
+    const asset = resolveClipAsset(scene, clip);
     if (!asset) continue;
 
-    const active =
-      time >= clip.start &&
-      time < clip.start + clip.duration &&
-      (asset.kind === "video" || asset.kind === "audio");
-    const el =
-      asset.kind === "video" ? getVideo(asset.url) : asset.kind === "audio" ? getAudio(asset.url) : null;
-    if (!el) continue;
+    const active = time >= clip.start && time < clip.start + clip.duration;
+    if (asset.kind === "image") {
+      if (active) jobs.push(waitForImage(asset.url).then(() => undefined));
+      continue;
+    }
+    if (asset.kind !== "video" && asset.kind !== "audio") continue;
+
+    const owner = mediaOwnerForClip(scene, clip);
+    const el = asset.kind === "video" ? getVideo(asset.url, owner) : getAudio(asset.url, owner);
 
     if (!active) {
       if (!el.paused) el.pause();
@@ -95,30 +198,18 @@ async function seekSources(state: EditorState, time: number): Promise<void> {
     }
 
     const target = clip.offset + (time - clip.start) * clip.speed;
-    el.volume = asset.kind === "audio" ? Math.min(1, Math.max(0, clip.volume)) : 0;
+    // When a clip extends past its source media, wrap the seek target so the
+    // media loops instead of clamping to the final frame.
+    const sourceDuration =
+      Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+    const wrapped =
+      sourceDuration > 0 && target >= sourceDuration ? target % sourceDuration : target;
+    // Export audio is mixed by FFmpeg from the source files. Keep every
+    // renderer media element silent so preview/export cannot leak audio.
+    el.volume = 0;
     el.playbackRate = Math.min(4, Math.max(0.25, clip.speed));
     el.muted = true;
-
-    if (Math.abs(el.currentTime - target) <= 1 / 60) continue;
-    jobs.push(
-      new Promise<void>((resolve) => {
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          el.removeEventListener("seeked", finish);
-          resolve();
-        };
-        el.addEventListener("seeked", finish);
-        try {
-          el.currentTime = Math.max(0, Math.min(target, (el.duration || target) - 0.001));
-        } catch {
-          finish();
-        }
-        // Never let one bad seek stall the whole export.
-        setTimeout(finish, 350);
-      }),
-    );
+    jobs.push(seekMediaElement(el, wrapped, asset.name));
   }
 
   await Promise.all(jobs);
@@ -154,49 +245,61 @@ export function exportVideo(
 
     onProgress({ phase: "starting", progress: 0, message: "Starting the encoder…" });
 
-    const started = await api.render.start({
-      width: settings.width,
-      height: settings.height,
-      fps,
-      bitrateMbps: settings.bitrateMbps,
-      outputPath: settings.outputPath,
-      audio: collectAudioTracks(state),
-    });
-    if (!started.ok) {
-      return { ok: false, error: started.error ?? "Could not start the encoder." };
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = settings.width;
-    canvas.height = settings.height;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) {
-      await api.render.cancel();
-      return { ok: false, error: "Canvas 2D is unavailable." };
-    }
-
-    const renderState: EditorState = {
-      ...state,
-      settings: { ...state.settings, width: settings.width, height: settings.height },
-    };
-
-    const unsubscribe = api.render.onProgress((p: RenderProgress) => {
-      if (p.phase === "error") {
-        onProgress({ phase: "error", progress: 0, message: p.message, error: p.error });
-      }
-    });
-
-    const every = Math.max(1, Math.floor(fps / 6));
-
+    let unsubscribe: (() => void) | null = null;
     try {
+      const started = await api.render.start({
+        width: settings.width,
+        height: settings.height,
+        fps,
+        bitrateMbps: settings.bitrateMbps,
+        outputPath: settings.outputPath,
+        audio: collectAudioTracks(state),
+      });
+      if (!started.ok) {
+        const error = started.error ?? "Could not start the encoder.";
+        onProgress({ phase: "error", progress: 0, message: error, error });
+        return { ok: false, error };
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = settings.width;
+      canvas.height = settings.height;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) {
+        const error = "Canvas 2D is unavailable.";
+        await api.render.cancel().catch((cancelError) => {
+          console.warn("[export] encoder cleanup failed", cancelError);
+        });
+        onProgress({ phase: "error", progress: 0, message: error, error });
+        return { ok: false, error };
+      }
+
+      const renderState: EditorState = {
+        ...state,
+        settings: { ...state.settings, width: settings.width, height: settings.height },
+      };
+      const scene = buildRenderScene(renderState, "export:");
+
+      if (document.fonts?.ready) {
+        await document.fonts.ready;
+      }
+
+      unsubscribe = api.render.onProgress((p: RenderProgress) => {
+        if (p.phase === "error") {
+          onProgress({ phase: "error", progress: 0, message: p.message, error: p.error });
+        }
+      });
+
+      const every = Math.max(1, Math.floor(fps / 6));
+
       for (let i = 0; i < frameCount; i++) {
         if (signal.cancelled) {
           await api.render.cancel();
           return { ok: false, error: "cancelled" };
         }
 
-        await seekSources(renderState, i / fps);
-        renderFrame(ctx, renderState, i / fps);
+        await seekSources(scene, i / fps);
+        renderFrame(ctx, scene, i / fps);
         await sendFrame(api, ctx.getImageData(0, 0, settings.width, settings.height).data);
 
         if (i % every === 0 || i === frameCount - 1) {
@@ -224,14 +327,15 @@ export function exportVideo(
     } catch (e) {
       try {
         await api.render.cancel();
-      } catch {
-        /* already stopped */
+      } catch (cancelError) {
+        console.warn("[export] encoder cleanup failed", cancelError);
       }
-      const message = (e as Error).message || "Export failed.";
+      const message = e instanceof Error ? e.message : "Export failed.";
+      console.error("[export] failed", e);
       onProgress({ phase: "error", progress: 0, message, error: message });
       return { ok: false, error: message };
     } finally {
-      unsubscribe();
+      unsubscribe?.();
     }
   })();
 
@@ -251,11 +355,27 @@ function sendFrame(
   api: NonNullable<Window["zf"]>,
   data: Uint8ClampedArray,
 ): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const off = api.render.onAck(() => {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let off = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
       off();
-      resolve();
-    });
-    api.render.frame(data.buffer as ArrayBuffer);
+      if (error) reject(error);
+      else resolve();
+    };
+    off = api.render.onAck(() => finish());
+    timer = setTimeout(
+      () => finish(new Error("The encoder stopped responding while receiving a frame.")),
+      20000,
+    );
+    try {
+      api.render.frame(data.buffer as ArrayBuffer);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error("Could not send a frame to the encoder."));
+    }
   });
 }

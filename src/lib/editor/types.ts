@@ -138,5 +138,10 @@ export interface ProjectFile {
   settings: ProjectSettings;
   tracks: Track[];
   clips: Clip[];
-  assets: Array<Pick<MediaAsset, "id" | "name" | "kind" | "path" | "duration" | "width" | "height" | "hasAudio">>;
+  assets: Array<
+    Pick<
+      MediaAsset,
+      "id" | "name" | "kind" | "path" | "duration" | "width" | "height" | "hasAudio" | "thumb"
+    >
+  >;
 }

@@ -12,6 +12,7 @@ import { spawn, execFile } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { app } from "electron";
 import type { AudioTrackSpec, Binaries, MediaProbe } from "./preload-types.js";
 
 export type { AudioTrackSpec, Binaries, MediaProbe };
@@ -34,8 +35,28 @@ async function which(bin: string): Promise<string | null> {
   return null;
 }
 
+/** Folder where `scripts/setup-binaries.mjs` stages ffmpeg for packaging. */
+function bundledBinDir(): string {
+  return app.isPackaged
+    ? join(process.resourcesPath, "bin", "ffmpeg")
+    : join(app.getAppPath(), "bin", "ffmpeg");
+}
+
 export async function findBinaries(): Promise<Binaries> {
   if (cached) return cached;
+
+  // 1. Binaries shipped with the app — checked first so the packaged build
+  //    never depends on whatever the end user happens to have installed.
+  const bDir = bundledBinDir();
+  const exe = (n: string) => (process.platform === "win32" ? `${n}.exe` : n);
+  const bFfmpeg = join(bDir, exe("ffmpeg"));
+  const bFfprobe = join(bDir, exe("ffprobe"));
+  if (existsSync(bFfmpeg) && existsSync(bFfprobe)) {
+    cached = { ffmpeg: bFfmpeg, ffprobe: bFfprobe, source: "bundled" };
+    return cached;
+  }
+
+  // 2. The user's own install (dev machines, or a manual FFmpeg install).
   const ffmpeg = await which("ffmpeg");
   const ffprobe = await which("ffprobe");
   if (ffmpeg && ffprobe) {
@@ -133,8 +154,9 @@ export function buildAudioGraph(audio: AudioTrackSpec[], inputBase = 1, sampleRa
 
     const inIdx = inputBase + i;
     let chain = `[${inIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo`;
+    chain += `,atrim=start=${(clip.offset || 0).toFixed(4)}:duration=${Math.max(0.02, clip.duration * clip.speed).toFixed(4)}`;
     if (speeds.length) chain += `,atempo=${speeds.join(",")}`;
-    chain += `,atrim=start=${(clip.offset || 0).toFixed(4)}:duration=${Math.max(0.02, clip.duration).toFixed(4)},asetpts=N/SR/TB`;
+    chain += `,asetpts=N/SR/TB`;
     chain += `,volume=${Math.max(0, Math.min(4, clip.volume)).toFixed(4)}`;
     if (delayMs > 0) chain += `,adelay=delays=${delayMs}:all=1`;
     chain += `[amix_${i}]`;
@@ -144,8 +166,6 @@ export function buildAudioGraph(audio: AudioTrackSpec[], inputBase = 1, sampleRa
 
   parts.push(
     `${labels.join("")}amix=inputs=${labels.length}:duration=longest:normalize=0:dropout_transition=0,` +
-      `alimiter=limit=0.95,` +
-      `loudnorm=I=-16:TP=-1.5:LRA=11:linear=true,` +
       `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[aout]`,
   );
   return parts.join(";");

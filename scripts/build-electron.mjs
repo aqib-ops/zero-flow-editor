@@ -14,7 +14,9 @@ await build({
   format: "esm",
   sourcemap: false,
   minify: false,
-  external: ["electron"],
+  // electron-updater reads app-update.yml at runtime and must not be inlined —
+  // it resolves native paths relative to process.resourcesPath.
+  external: ["electron", "electron-updater"],
   // Electron's ESM loader needs explicit .js specifiers — tsc keeps them from
   // the source, so nothing to rewrite here.
   logLevel: "info",
