@@ -2,7 +2,7 @@
  * Electron preload — the only bridge between the renderer and Node.
  * Exposes a small typed surface so the editor never touches fs, spawn or ipc.
  */
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   AppInfo,
   AudioTrackSpec,
@@ -26,6 +26,20 @@ export type {
 };
 
 const api = {
+  files: {
+    /**
+     * Absolute path of a dragged-in File.
+     * Electron 37 removed `File.path`, so drag & drop must go through webUtils.
+     */
+    getPathForFile: (file: File): string => {
+      try {
+        return webUtils.getPathForFile(file);
+      } catch {
+        return "";
+      }
+    },
+  },
+
   ffmpeg: {
     /** Locate ffmpeg/ffprobe on this machine. */
     findBinaries: (): Promise<Binaries> => ipcRenderer.invoke("ff:find-binaries"),

@@ -1,7 +1,8 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, protocol, net } from "electron";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { app, BrowserWindow, ipcMain, dialog, shell, protocol } from "electron";
+import { join, dirname, extname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync, readFileSync, writeFileSync, statSync, createReadStream } from "node:fs";
+import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import {
   findBinaries,
@@ -95,6 +96,24 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  const MEDIA_MIME: Record<string, string> = {
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska",
+    webm: "video/webm", avi: "video/x-msvideo", ts: "video/mp2t",
+    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac",
+    ogg: "audio/ogg", opus: "audio/opus", flac: "audio/flac",
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
+    gif: "image/gif", svg: "image/svg+xml", bmp: "image/bmp",
+  };
+
+  /**
+   * Serve local media with full HTTP Range support (206 Partial Content).
+   *
+   * Chromium *requires* working Range responses to seek into a video before it
+   * is fully buffered. `net.fetch(fileURL)` ignores the Range header and always
+   * returns the whole file with status 200, which made <video> unseekable during
+   * export/scrubbing — every seek landed at 0.0s and the compositor aborted with
+   * "Media seek did not reach ...". Streaming the requested byte window fixes it.
+   */
   protocol.handle("zf-media", (request) => {
     try {
       const prefix = "zf-media://local/";
@@ -108,7 +127,77 @@ app.whenReady().then(() => {
           filePath = filePath.slice(1);
         }
       }
-      return net.fetch(pathToFileURL(filePath).toString());
+
+      if (!filePath || !existsSync(filePath)) {
+        return new Response("Media not found", { status: 404 });
+      }
+
+      const stat = statSync(filePath);
+      if (!stat.isFile()) {
+        return new Response("Not a file", { status: 404 });
+      }
+
+      const size = stat.size;
+      const ext = extname(filePath).replace(".", "").toLowerCase();
+      const mime = MEDIA_MIME[ext] || "application/octet-stream";
+      const baseHeaders: Record<string, string> = {
+        "Content-Type": mime,
+        "Accept-Ranges": "bytes",
+        "Last-Modified": stat.mtime.toUTCString(),
+        "Cache-Control": "no-cache",
+      };
+
+      const rangeHeader = request.headers.get("range");
+      const m = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim()) : null;
+
+      if (m && (m[1] !== "" || m[2] !== "")) {
+        let start: number;
+        let end: number;
+        if (m[1] === "") {
+          // Suffix form: bytes=-500 → last 500 bytes.
+          const suffix = Number(m[2]);
+          if (!Number.isFinite(suffix) || suffix <= 0) {
+            return new Response(null, {
+              status: 416,
+              headers: { ...baseHeaders, "Content-Range": `bytes */${size}` },
+            });
+          }
+          start = Math.max(0, size - suffix);
+          end = size - 1;
+        } else {
+          start = Number(m[1]);
+          end = m[2] === "" ? size - 1 : Number(m[2]);
+        }
+
+        if (
+          !Number.isFinite(start) || !Number.isFinite(end) ||
+          start < 0 || end < start || start >= size
+        ) {
+          return new Response(null, {
+            status: 416,
+            headers: { ...baseHeaders, "Content-Range": `bytes */${size}` },
+          });
+        }
+        end = Math.min(end, size - 1);
+
+        const body = Readable.toWeb(
+          createReadStream(filePath, { start, end }),
+        ) as ReadableStream;
+        return new Response(body, {
+          status: 206,
+          headers: {
+            ...baseHeaders,
+            "Content-Range": `bytes ${start}-${end}/${size}`,
+            "Content-Length": String(end - start + 1),
+          },
+        });
+      }
+
+      const full = Readable.toWeb(createReadStream(filePath)) as ReadableStream;
+      return new Response(full, {
+        status: 200,
+        headers: { ...baseHeaders, "Content-Length": String(size) },
+      });
     } catch (err) {
       console.error("[zf-media protocol error]", err);
       return new Response("Media not found", { status: 404 });

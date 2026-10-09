@@ -176,10 +176,12 @@ export function ImportPanel() {
         onDrop={(e) => {
           e.preventDefault();
           setDragOver(false);
-          const files = Array.from(e.dataTransfer.files) as unknown as Array<{ path?: string; name: string }>;
-          const paths = files.map((f) => (f as unknown as { path: string }).path).filter(Boolean);
+          const files = Array.from(e.dataTransfer.files);
+          // Electron 37 dropped `File.path`; the preload resolves real paths via webUtils.
+          const getPath = window.zf?.files?.getPathForFile;
+          const paths = getPath ? files.map((f) => getPath(f)).filter(Boolean) : [];
           if (paths.length) void ingest(paths);
-          else toast.error("Drag files from a folder window so their paths are available");
+          else toast.error("Could not read those files — use Click to import instead");
         }}
       >
         <FolderOpen className="mx-auto size-6 text-muted-foreground" />

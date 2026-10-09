@@ -91,6 +91,10 @@ export interface UpdateStatus {
 }
 
 export interface ZfApi {
+  files: {
+    /** Absolute path of a dragged-in File (Electron removed `File.path`). */
+    getPathForFile: (file: File) => string;
+  };
   ffmpeg: {
     findBinaries: () => Promise<Binaries>;
     probe: (path: string) => Promise<MediaProbe>;
