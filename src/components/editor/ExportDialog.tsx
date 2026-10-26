@@ -4,9 +4,6 @@ import {
   Download,
   FolderOpen,
   HardDrive,
-  Loader2,
-  Settings,
-  Sparkles,
   Video,
   X,
 } from "lucide-react";
@@ -56,13 +53,59 @@ const BITRATE_PRESETS = [
   { value: 32, label: "Ultra (32M)" },
 ];
 
+/** Last-used export choices, so repeat exports don't need re-picking. */
+const EXPORT_PREFS_KEY = "zf.exportPrefs";
+
+interface ExportPrefs {
+  title?: string;
+  heightLabel?: ExportHeightLabel;
+  fps?: number;
+  bitrate?: number;
+  format?: string;
+}
+
+function loadExportPrefs(): ExportPrefs {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(EXPORT_PREFS_KEY) ?? "{}") as ExportPrefs;
+    // Validate against the current option lists so stale storage can't put the
+    // dialog into an unselectable state.
+    return {
+      title: typeof raw.title === "string" && raw.title.trim() ? raw.title : undefined,
+      heightLabel:
+        typeof raw.heightLabel === "string" && raw.heightLabel in EXPORT_HEIGHTS
+          ? raw.heightLabel
+          : undefined,
+      fps: [24, 30, 60].includes(raw.fps as number) ? raw.fps : undefined,
+      bitrate: BITRATE_PRESETS.some((b) => b.value === raw.bitrate) ? raw.bitrate : undefined,
+      format: ["mp4", "mov", "mkv"].includes(raw.format as string) ? raw.format : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function saveExportPrefs(prefs: ExportPrefs): void {
+  try {
+    window.localStorage.setItem(EXPORT_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* storage blocked — defaults next time */
+  }
+}
+
 export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
-  const [title, setTitle] = useState("Zero_Flow_Video");
-  const [heightLabel, setHeightLabel] = useState<ExportHeightLabel>("1080p");
-  const [fps, setFps] = useState<number>(30);
-  const [bitrate, setBitrate] = useState<number>(12);
-  const [format, setFormat] = useState<string>("mp4");
+  // Restore the last-used settings once per mount; every change persists so
+  // the next export starts where the previous one left off.
+  const savedPrefs = useRef(loadExportPrefs());
+  const [title, setTitle] = useState(savedPrefs.current.title ?? "Zero_Flow_Video");
+  const [heightLabel, setHeightLabel] = useState<ExportHeightLabel>(savedPrefs.current.heightLabel ?? "1080p");
+  const [fps, setFps] = useState<number>(savedPrefs.current.fps ?? 30);
+  const [bitrate, setBitrate] = useState<number>(savedPrefs.current.bitrate ?? 12);
+  const [format, setFormat] = useState<string>(savedPrefs.current.format ?? "mp4");
   const [customPath, setCustomPath] = useState<string>("");
+
+  useEffect(() => {
+    saveExportPrefs({ title, heightLabel, fps, bitrate, format });
+  }, [title, heightLabel, fps, bitrate, format]);
 
   const [isExporting, setIsExporting] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -101,7 +144,7 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
     const api = window.zf;
     if (!api?.dialog) return;
     const defaultName = `${title.trim() || "video"}.${format}`;
-    const chosen = await api.dialog.saveVideo(defaultName);
+    const chosen = await api.dialog.saveVideo(defaultName, format as "mp4" | "mov" | "mkv");
     if (chosen) {
       setCustomPath(chosen);
     }
@@ -120,7 +163,7 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
     let outputPath = customPath;
     if (!outputPath) {
       const defaultName = `${title.trim() || "video"}.${format}`;
-      const chosen = await api.dialog.saveVideo(defaultName);
+      const chosen = await api.dialog.saveVideo(defaultName, format as "mp4" | "mov" | "mkv");
       if (!chosen) return;
       outputPath = chosen;
       setCustomPath(chosen);
@@ -139,6 +182,7 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
         fps,
         bitrateMbps: bitrate,
         outputPath,
+        format: format as "mp4" | "mov" | "mkv",
       },
       (p) => {
         setProgress(p.progress);
@@ -158,6 +202,11 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
       setExportComplete(true);
       setExportedFilePath(result.outputPath);
       toast.success(`Video exported successfully!`);
+      // Session-based app: the export was the point of the session, so drop
+      // the derived caches right away instead of waiting for quit.
+      void window.zf?.app?.clearCache?.().catch(() => {
+        /* best effort — the quit sweep catches the rest */
+      });
     } else if (result.error !== "cancelled") {
       toast.error(result.error || "Export failed");
     }
@@ -199,6 +248,7 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
           {!isExporting && (
             <button
               onClick={onClose}
+              aria-label="Close export dialog"
               className="grid size-7 place-items-center rounded-lg text-muted-foreground hover:bg-rail hover:text-foreground transition-colors"
             >
               <X className="size-4" />
@@ -303,6 +353,11 @@ export function ExportDialog({ isOpen, onClose, state }: ExportDialogProps) {
               <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                 Resolution ({exportSize.width}×{exportSize.height})
               </label>
+              {heightLabel === "4K" && fps >= 60 && (
+                <p className="mt-1 text-[10px] text-amber-500/90">
+                  4K at 60 fps renders on the CPU and can take several times the video's length.
+                </p>
+              )}
               <div className="mt-1.5 grid grid-cols-2 gap-2">
                 {RESOLUTION_OPTIONS.map((r) => (
                   <button

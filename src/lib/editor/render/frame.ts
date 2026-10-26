@@ -18,7 +18,12 @@ export function renderFrame(
 
   const order = ["video", "overlay", "text"] as const;
   for (const kind of order) {
-    for (const track of scene.layerTracks[kind]) {
+    const tracks = scene.layerTracks[kind];
+    // Timeline rows render top-to-bottom in tracks-array order, so drawing in
+    // reverse paints the topmost row last — higher rows sit in front of lower
+    // ones, matching CapCut-style layer stacking.
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      const track = tracks[i];
       const clips = activeClipsForTrack(
         scene.clipsByTrack.get(track.id) ?? [],
         time,

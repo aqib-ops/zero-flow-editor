@@ -16,3 +16,4 @@ Thumbs.db
 
 # Staged runtime binaries (produced by scripts/setup-*.mjs, never committed)
 bin/
+.playwright-mcp/

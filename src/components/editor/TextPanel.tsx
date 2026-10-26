@@ -183,7 +183,7 @@ export function TextPanel() {
       if (generatedClips.length > 0) {
         addClips(generatedClips);
         toast.success(
-          `✨ Generated ${generatedClips.length} one-line captions with Whisper ${modelLabel}!`,
+          `Generated ${generatedClips.length} one-line captions with Whisper ${modelLabel}`,
           { id: toastId },
         );
       } else {
@@ -198,7 +198,7 @@ export function TextPanel() {
 
   return (
     <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1">
-      {/* ⚡ Instant local caption generation */}
+      {/* Instant local caption generation */}
       <div className="relative overflow-hidden rounded-xl border border-primary/40 bg-gradient-to-br from-primary/20 via-background to-panel p-3.5 shadow-lg">
         <div className="flex items-center justify-between mb-1.5">
           <span className="flex items-center gap-1.5 text-xs font-bold text-primary">

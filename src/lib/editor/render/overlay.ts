@@ -1,6 +1,6 @@
 import { getImage, getVideo, isImageAsset, isVideoAsset } from "../media";
 import type { Clip, MediaAsset } from "../types";
-import { animationTransform, applyTransition, clamp01, drawContain } from "./draw-utils";
+import { animationTransform, applyTransition, clamp01, drawContainPlaced } from "./draw-utils";
 import { mediaOwnerForClip, type RenderScene } from "./scene";
 
 function mulberry(seed: number) {
@@ -58,7 +58,6 @@ function drawBuiltinOverlay(
   H: number,
 ) {
   const seed = Math.floor(time * 24);
-  const rnd = mulberry(seed + 1);
   switch (kind) {
     case "grain": {
       const pattern = ctx.createPattern(getGrainTile(seed + 1), "repeat");
@@ -143,12 +142,32 @@ function drawImportedOverlay(
   const local = time - clip.start;
   const p = clamp01(local / Math.max(0.001, clip.duration));
   const { scale, dx, dy } = animationTransform(clip, p);
+  // User placement (position/size/rotation) applies to imported overlays only;
+  // built-in procedural effects always fill the frame.
+  const placed = clip.overlay && clip.overlay.type !== "builtin";
+  const pivotX = placed ? clamp01(clip.overlayX ?? 0.5) : 0.5;
+  const pivotY = placed ? clamp01(clip.overlayY ?? 0.5) : 0.5;
+  const sizeMul = placed ? Math.max(0.05, clip.overlayScale ?? 1) : 1;
+  const rotation = placed ? (clip.overlayRotation ?? 0) : 0;
 
   if (isImageAsset(asset)) {
     const img = getImage(asset.url);
     if (img.complete && img.naturalWidth) {
       applyTransition(ctx, clip, local, W, H);
-      drawContain(ctx, img, img.naturalWidth, img.naturalHeight, W, H, scale, dx, dy);
+      drawContainPlaced(
+        ctx,
+        img,
+        img.naturalWidth,
+        img.naturalHeight,
+        W,
+        H,
+        scale * sizeMul,
+        dx,
+        dy,
+        pivotX,
+        pivotY,
+        rotation,
+      );
     }
     return;
   }
@@ -157,7 +176,20 @@ function drawImportedOverlay(
     const video = getVideo(asset.url, mediaOwnerForClip(scene, clip));
     if (video.readyState >= 2 && video.videoWidth) {
       applyTransition(ctx, clip, local, W, H);
-      drawContain(ctx, video, video.videoWidth, video.videoHeight, W, H, scale, dx, dy);
+      drawContainPlaced(
+        ctx,
+        video,
+        video.videoWidth,
+        video.videoHeight,
+        W,
+        H,
+        scale * sizeMul,
+        dx,
+        dy,
+        pivotX,
+        pivotY,
+        rotation,
+      );
     }
   }
 }

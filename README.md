@@ -40,7 +40,7 @@ The 1-click auto-captioning feature uses a local OpenAI Whisper model.
 ```bash
 pip install openai-whisper
 ```
-It runs offline on your machine using the `tiny` model.
+It runs offline on your machine using the `base` model.
 
 ## What it does
 

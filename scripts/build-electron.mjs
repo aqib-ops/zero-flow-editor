@@ -17,6 +17,9 @@ await build({
   // electron-updater reads app-update.yml at runtime and must not be inlined —
   // it resolves native paths relative to process.resourcesPath.
   external: ["electron", "electron-updater"],
+  // scripts/transcribe.py is embedded as a string so self-setup.ts can write it
+  // next to the downloaded runtime (Python cannot read files out of app.asar).
+  loader: { ".py": "text" },
   // Electron's ESM loader needs explicit .js specifiers — tsc keeps them from
   // the source, so nothing to rewrite here.
   logLevel: "info",

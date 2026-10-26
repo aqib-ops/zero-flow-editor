@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   ChevronsLeftRight,
   ChevronsUpDown,
   Eye,
@@ -9,6 +11,7 @@ import {
   Maximize2,
   Minus,
   Plus,
+  Trash2,
   Unlock,
   Volume2,
   VolumeX,
@@ -20,12 +23,11 @@ import { cn } from "@/lib/utils";
 import { useEditor, makeClip } from "@/lib/editor/store";
 import { baseName, formatTime } from "@/lib/editor/media";
 import { clipEnd, projectDuration } from "@/lib/editor/render";
-import { overlayKey } from "@/lib/editor/store";
 import { BUILTIN_OVERLAYS } from "@/lib/editor/styles";
 import { useAudioWaveform } from "@/lib/editor/waveform";
 import type { Clip, MediaAsset, Track, TrackKind } from "@/lib/editor/types";
 
-const HEADER_W = 148;
+const HEADER_W = 200;
 const ROW_H = 56;
 const SNAP_PX = 8;
 const TRIM_MIN = 0.1;
@@ -91,10 +93,15 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
     setPlayhead,
     addTrack,
     addClips,
+    moveTrack,
+    removeTrack,
   } = useEditor();
   const scrollRef = useRef<HTMLDivElement>(null);
   const laneRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  // Tracks auto-created during the current drag, keyed by edge direction and
+  // clip kind ("up:video"), so a gesture creates at most one per edge.
+  const dragEdgesRef = useRef<Record<string, string>>({});
   const scrubbing = useRef(false);
   const [snapLine, setSnapLine] = useState<number | null>(null);
   const [dropHint, setDropHint] = useState<{ time: number; trackId: string } | null>(null);
@@ -178,7 +185,15 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
   const beginDrag = (e: React.PointerEvent, clip: Clip, mode: DragMode) => {
     if (state.tracks.find((t) => t.id === clip.trackId)?.locked) return;
     e.stopPropagation();
-    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    // Capture on the lane container, not the clip bar: moving a clip to
+    // another row remounts the bar element mid-drag, which would drop the
+    // pointer capture and kill the gesture. The lane is stable throughout.
+    try {
+      (laneRef.current ?? (e.currentTarget as Element)).setPointerCapture(e.pointerId);
+    } catch {
+      /* pointer already inactive */
+    }
+    dragEdgesRef.current = {};
 
     const alreadySelected = state.selectedClipIds.includes(clip.id);
     let selection = state.selectedClipIds;
@@ -272,7 +287,9 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
       const delta = newStart - groupStart;
 
       // Vertical movement shifts each selected clip by the same number of
-      // compatible track rows, but only if every clip has a valid target.
+      // compatible track rows. Dragging one row past the edge of the block
+      // auto-creates a new track in that direction (once per gesture), so a
+      // clip can always be layered above or below the existing ones.
       const rowDelta = Math.round(dy / ROW_H);
       const trackFor = new Map<string, string>();
       if (rowDelta !== 0) {
@@ -282,12 +299,27 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
             (t) => t.kind === origin.kind && !t.locked,
           );
           const currentIndex = compatible.findIndex((t) => t.id === origin.trackId);
-          const nextIndex = currentIndex + rowDelta;
-          if (currentIndex < 0 || nextIndex < 0 || nextIndex >= compatible.length) {
+          if (currentIndex < 0) {
             valid = false;
             break;
           }
-          trackFor.set(origin.id, compatible[nextIndex].id);
+          const nextIndex = currentIndex + rowDelta;
+          if (nextIndex >= 0 && nextIndex < compatible.length) {
+            trackFor.set(origin.id, compatible[nextIndex].id);
+            continue;
+          }
+          // Out of bounds: land on the track created earlier this gesture,
+          // or create one now just past the edge.
+          const goingUp = nextIndex < 0;
+          const edgeKey = `${goingUp ? "up" : "down"}:${origin.kind}`;
+          const created = dragEdgesRef.current[edgeKey];
+          if (created) {
+            trackFor.set(origin.id, created);
+          } else {
+            const id = addTrack(origin.kind, goingUp ? "start" : "end");
+            dragEdgesRef.current[edgeKey] = id;
+            trackFor.set(origin.id, id);
+          }
         }
         if (!valid) trackFor.clear();
       }
@@ -364,6 +396,24 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
 
   const rows = state.tracks;
 
+  // A track can only swap with an adjacent track of the same kind so kind
+  // blocks stay contiguous (draw order is defined per kind block).
+  const canMoveTrack = (track: Track, direction: "up" | "down") => {
+    const kindTracks = rows.filter((t) => t.kind === track.kind);
+    const i = kindTracks.findIndex((t) => t.id === track.id);
+    return direction === "up" ? i > 0 : i < kindTracks.length - 1;
+  };
+
+  // Pending track deletion shown in the confirm dialog.
+  const [trackToDelete, setTrackToDelete] = useState<string | null>(null);
+  const deleteTrack =
+    trackToDelete != null
+      ? (state.tracks.find((t) => t.id === trackToDelete) ?? null)
+      : null;
+  const deleteClipCount = deleteTrack
+    ? state.clips.filter((c) => c.trackId === deleteTrack.id).length
+    : 0;
+
   // Auto-scroll during playback so the playhead never leaves the visible area.
   useEffect(() => {
     const el = scrollRef.current;
@@ -379,16 +429,11 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
     }
   }, [state.playhead, state.playing, zoom]);
 
-  const overlayIdentities = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const c of state.clips) if (c.kind === "overlay" && c.overlay) m.set(c.id, overlayKey(c.overlay));
-    return m;
-  }, [state.clips]);
-
   return (
     <div className="flex h-full min-h-0 flex-col bg-panel">
-      {/* toolbar */}
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1">
+      {/* toolbar — wraps so the add-track / zoom / height controls stay
+          reachable on narrow windows instead of overflowing the row edge */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border px-3 py-1">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Timeline
         </span>
@@ -408,6 +453,8 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
             step={1}
             value={zoom}
             onChange={(e) => update((s) => ({ ...s, zoom: Number(e.target.value) }), false)}
+            aria-label="Timeline zoom"
+            aria-valuetext={`${zoom} pixels per second`}
             className="h-1 w-28 cursor-pointer appearance-none rounded-full bg-muted accent-primary"
           />
           <Button
@@ -551,10 +598,29 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
                     {track.name}
                   </span>
                   <div className="ml-auto flex shrink-0">
+                    <button
+                      className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:hover:text-muted-foreground"
+                      title={`Move ${track.name} up`}
+                      aria-label={`Move ${track.name} up`}
+                      disabled={!canMoveTrack(track, "up")}
+                      onClick={() => moveTrack(track.id, "up")}
+                    >
+                      <ChevronUp className="size-3.5" />
+                    </button>
+                    <button
+                      className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:hover:text-muted-foreground"
+                      title={`Move ${track.name} down`}
+                      aria-label={`Move ${track.name} down`}
+                      disabled={!canMoveTrack(track, "down")}
+                      onClick={() => moveTrack(track.id, "down")}
+                    >
+                      <ChevronDown className="size-3.5" />
+                    </button>
                     {track.kind === "audio" ? (
                       <button
                         className="rounded p-1 text-muted-foreground hover:text-foreground"
                         title={track.muted ? "Unmute" : "Mute"}
+                        aria-label={`${track.muted ? "Unmute" : "Mute"} ${track.name}`}
                         onClick={() =>
                           update((s) => ({
                             ...s,
@@ -570,6 +636,7 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
                       <button
                         className="rounded p-1 text-muted-foreground hover:text-foreground"
                         title={track.hidden ? "Show track" : "Hide track"}
+                        aria-label={`${track.hidden ? "Show" : "Hide"} ${track.name}`}
                         onClick={() =>
                           update((s) => ({
                             ...s,
@@ -585,6 +652,7 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
                     <button
                       className="rounded p-1 text-muted-foreground hover:text-foreground"
                       title={track.locked ? "Unlock track" : "Lock track"}
+                      aria-label={`${track.locked ? "Unlock" : "Lock"} ${track.name}`}
                       onClick={() =>
                         update((s) => ({
                           ...s,
@@ -595,6 +663,14 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
                       }
                     >
                       {track.locked ? <Lock className="size-3.5" /> : <Unlock className="size-3.5" />}
+                    </button>
+                    <button
+                      className="rounded p-1 text-muted-foreground hover:text-destructive"
+                      title={`Delete ${track.name}`}
+                      aria-label={`Delete ${track.name}`}
+                      onClick={() => setTrackToDelete(track.id)}
+                    >
+                      <Trash2 className="size-3.5" />
                     </button>
                   </div>
                 </div>
@@ -625,7 +701,7 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
                       clip.kind === "text"
                         ? clip.styleId
                         : clip.kind === "overlay"
-                          ? `${clip.blend}${overlayIdentities.has(clip.id) ? "" : ""}`
+                          ? overlayLabel(clip)
                           : clip.assetId
                             ? baseName(
                                 state.assets.find((a) => a.id === clip.assetId)?.path ?? clip.name,
@@ -720,6 +796,45 @@ export function Timeline({ height, onHeightChange, maxHeight, defaultHeight }: T
           </div>
         </div>
       </div>
+
+      {/* delete-layer confirmation */}
+      {deleteTrack && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-border bg-panel-raised p-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-destructive/15 text-destructive">
+                <Trash2 className="size-4" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-sm font-bold tracking-tight text-foreground">
+                  Delete {deleteTrack.name}?
+                </h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {deleteClipCount > 0
+                    ? `This removes the layer and its ${deleteClipCount} clip${deleteClipCount === 1 ? "" : "s"} from the timeline.`
+                    : "This removes the empty layer from the timeline."}{" "}
+                  You can undo this afterwards.
+                </p>
+              </div>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <Button size="sm" variant="ghost" onClick={() => setTrackToDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => {
+                  removeTrack(deleteTrack.id);
+                  setTrackToDelete(null);
+                }}
+              >
+                Delete layer
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

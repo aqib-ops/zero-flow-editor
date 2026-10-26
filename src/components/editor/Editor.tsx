@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   FileText,
   Film,
-  FolderOpen,
   Layers,
   Minus,
-  Save,
+  Plus,
   Settings2,
   SlidersHorizontal,
   Sparkles,
@@ -15,12 +14,9 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Toaster } from "@/components/ui/sonner";
 import { cn } from "@/lib/utils";
 import { useEditor } from "@/lib/editor/store";
-import { baseName, toFileUrl } from "@/lib/editor/media";
 import { beginAxisResize, ResizeHandle, useStoredSize } from "@/lib/editor/resize";
 import { ImportPanel } from "./ImportPanel";
 import { TextPanel } from "./TextPanel";
@@ -32,7 +28,6 @@ import { Preview } from "./Preview";
 import { Timeline } from "./Timeline";
 import { ExportDialog } from "./ExportDialog";
 import { SettingsDialog } from "./SettingsDialog";
-import type { ProjectFile } from "@/lib/editor/types";
 
 const TABS = [
   { id: "import", label: "Import", icon: Upload },
@@ -84,6 +79,7 @@ function TitleBar() {
             className="grid h-9 w-11 place-items-center text-muted-foreground hover:bg-rail hover:text-foreground"
             onClick={() => void window.zf?.window?.minimize()}
             title="Minimize"
+            aria-label="Minimize"
           >
             <Minus className="size-3.5" />
           </button>
@@ -91,6 +87,7 @@ function TitleBar() {
             className="grid h-9 w-11 place-items-center text-muted-foreground hover:bg-rail hover:text-foreground"
             onClick={() => void window.zf?.window?.toggleMaximize()}
             title={maximized ? "Restore" : "Maximize"}
+            aria-label={maximized ? "Restore" : "Maximize"}
           >
             <Square className="size-3" />
           </button>
@@ -98,6 +95,7 @@ function TitleBar() {
             className="grid h-9 w-11 place-items-center text-muted-foreground hover:bg-destructive/90 hover:text-white"
             onClick={() => void window.zf?.window?.close()}
             title="Close"
+            aria-label="Close"
           >
             <X className="size-3.5" />
           </button>
@@ -107,8 +105,18 @@ function TitleBar() {
   );
 }
 
-export function Editor() {
-  const { state, setAspectRatio, loadProject } = useEditor();
+export function Editor({
+  projectId,
+  projectName,
+  onHome,
+  onProjectChange,
+}: {
+  projectId: string;
+  projectName: string;
+  onHome: () => void;
+  onProjectChange: (info: { id: string; name: string }) => void;
+}) {
+  const { state, setAspectRatio } = useEditor();
   const [tab, setTab] = useState<TabId>("import");
   const [timelineHeight, setTimelineHeightRaw] = useStoredSize(
     "zf.timelineHeight",
@@ -141,13 +149,25 @@ export function Editor() {
     return () => window.removeEventListener("resize", onResize);
   }, [timelineHeight, panelWidth, setTimelineHeight, setPanelWidth]);
 
-  const saveProject = useCallback(async () => {
-    const file: ProjectFile = {
+  // ---- Autosave (Recent Projects) ----
+  // Every edit lands on disk ~1.5s after it stops changing, and beforeunload
+  // flushes immediately so closing the window (or a crash) loses at most the
+  // last second and a half. Media is referenced by path, so a save is a few KB.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const projectNameRef = useRef(projectName);
+  projectNameRef.current = projectName;
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSavedJson = useRef<string>("");
+
+  const saveNow = useCallback(() => {
+    const s = stateRef.current;
+    const file = {
       version: 1,
-      settings: state.settings,
-      tracks: state.tracks,
-      clips: state.clips,
-      assets: state.assets.map((a) => ({
+      settings: s.settings,
+      tracks: s.tracks,
+      clips: s.clips,
+      assets: s.assets.map((a) => ({
         id: a.id,
         name: a.name,
         kind: a.kind,
@@ -159,23 +179,66 @@ export function Editor() {
         thumb: a.thumb,
       })),
     };
-    const saved = await window.zf?.dialog?.saveProject(file);
-    if (saved) toast.success(`Project saved to ${baseName(saved)}`);
-  }, [state]);
+    window.zf?.projects
+      ?.save(projectId, projectNameRef.current.trim() || "Untitled project", file)
+      .catch((err: unknown) =>
+        console.warn("[autosave] failed", err instanceof Error ? err.message : err),
+      );
+  }, [projectId]);
 
-  const openProject = useCallback(async () => {
-    const data = (await window.zf?.dialog?.openProject()) as ProjectFile | null;
-    if (!data) return;
-    // Rebuild the renderer URLs from the stored absolute paths.
-    const assets = (data.assets ?? []).map((a) => ({ ...a, url: toFileUrl(a.path) }));
-    loadProject({
-      settings: data.settings,
-      tracks: data.tracks,
-      clips: data.clips,
-      assets,
+  // Serialized project content, recomputed only when a saved field actually
+  // changes. Deliberately excludes playhead/playing/zoom/snap/selection, so
+  // scrubbing or playback never re-runs this or resets the debounce timer.
+  const projectJson = useMemo(() => {
+    const s = stateRef.current;
+    return JSON.stringify({
+      version: 1,
+      settings: s.settings,
+      tracks: s.tracks,
+      clips: s.clips,
+      assets: s.assets.map((a) => ({
+        id: a.id,
+        name: a.name,
+        kind: a.kind,
+        path: a.path,
+        duration: a.duration,
+        width: a.width,
+        height: a.height,
+        hasAudio: a.hasAudio,
+        thumb: a.thumb,
+      })),
     });
-    toast.success("Project loaded");
-  }, [loadProject]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reads the latest state via ref by design
+  }, [state.settings, state.tracks, state.clips, state.assets]);
+
+  // Debounced autosave: re-arms only when saved content changed; playback and
+  // selection churn never reach here.
+  useEffect(() => {
+    if (!projectId) return;
+    if (projectJson === lastSavedJson.current) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      lastSavedJson.current = projectJson;
+      saveNow();
+    }, 1500);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [projectJson, projectId, saveNow]);
+
+  // Crash/close flush: window teardown does not wait for the debounce.
+  useEffect(() => {
+    const flush = () => {
+      if (!projectId) return;
+      saveNow();
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, [projectId, saveNow]);
+
+  // Starting a new project from the editor keeps this one in recents — it is
+  // already autosaved, so no confirmation is needed.
+  const startNewProject = () => onHome();
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
@@ -183,6 +246,22 @@ export function Editor() {
 
       {/* toolbar */}
       <header className="flex flex-wrap items-center gap-3 border-b border-border bg-panel px-3 py-1.5">
+        <Button size="sm" variant="ghost" className="h-7 gap-1.5" onClick={startNewProject} title="Start a new project">
+          <Plus className="size-3.5" /> <span className="hidden sm:inline">New project</span>
+        </Button>
+        <div className="min-w-0 max-w-56">
+          <input
+            value={projectName}
+            onChange={(e) => onProjectChange({ id: projectId, name: e.target.value })}
+            aria-label="Project name"
+            maxLength={80}
+            className="w-full truncate rounded border border-transparent bg-transparent px-1 text-xs font-semibold tracking-tight outline-none hover:border-border focus:border-primary/60"
+            placeholder="Untitled project"
+          />
+          <p className="truncate px-1 text-[10px] text-muted-foreground">
+            Autosaves locally · recoverable after a crash
+          </p>
+        </div>
         <div className="flex items-center gap-1.5">
           <span className="text-[11px] font-medium text-muted-foreground">Ratio:</span>
           <select
@@ -219,24 +298,24 @@ export function Editor() {
           >
             <Settings2 className="size-3.5" />
           </Button>
-          <Button size="sm" variant="ghost" className="h-7" onClick={openProject} title="Open project">
-            <FolderOpen className="size-3.5" /> Open
-          </Button>
-          <Button size="sm" variant="ghost" className="h-7" onClick={saveProject} title="Save project">
-            <Save className="size-3.5" /> Save
-          </Button>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <nav className="flex w-[4.5rem] shrink-0 flex-col items-center gap-1 border-r border-border bg-panel py-2">
+        {/* min-h-0 + overflow-y-auto: when the timeline is expanded the preview
+            row can end up shorter than the six tabs, so the rail scrolls (the
+            thin 9px scrollbar in styles.css keeps it unobtrusive) instead of
+            clipping the lowest entries — Edit, Motion, Sync. Buttons are
+            shrink-0 and slightly tighter so the rail still fits without
+            scrolling at normal window sizes. */}
+        <nav className="flex min-h-0 w-[4.5rem] shrink-0 flex-col items-center gap-1 overflow-y-auto border-r border-border bg-panel py-2">
           {TABS.map((t) => (
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
               title={t.label}
               className={cn(
-                "flex w-14 flex-col items-center gap-1 rounded-md py-2 text-[10px] transition-colors",
+                "flex w-14 shrink-0 flex-col items-center gap-1 rounded-md px-0.5 py-1.5 text-[10px] transition-colors",
                 tab === t.id
                   ? "bg-accent text-foreground"
                   : "text-muted-foreground hover:bg-rail hover:text-foreground",

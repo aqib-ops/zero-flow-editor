@@ -155,6 +155,36 @@
     font: inherit;
   }
 
+  /* ui-ux-pro-max: every clickable shows a pointer; disabled shows not-allowed.
+     Tailwind v4 resets buttons to cursor:default, so declare it once here
+     instead of repeating cursor-pointer on 50+ controls. */
+  button,
+  [role="button"] {
+    cursor: pointer;
+  }
+  button:disabled,
+  button[aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+  input[type="range"]:not(:disabled),
+  select:not(:disabled) {
+    cursor: pointer;
+  }
+  input:disabled,
+  select:disabled {
+    cursor: not-allowed;
+  }
+
+  /* ui-ux-pro-max: visible keyboard focus on all native controls. The shadcn
+     Button keeps its own ring (excluded below to avoid a double ring). */
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  :where(button[data-slot="button"]):focus-visible {
+    outline: none;
+  }
+
   ::-webkit-scrollbar {
     width: 9px;
     height: 9px;
@@ -211,6 +241,15 @@
 @media (prefers-reduced-motion: reduce) {
   .animate-in {
     animation: none !important;
+  }
+  /* ui-ux-pro-max: motion sensitivity — neutralize hover lifts, zooms and
+     transitions for users who request reduced motion. Presentational only. */
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 

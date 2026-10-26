@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Film, Image as ImageIcon, Music, Plus, Trash2, FolderOpen, Play, Pause, Sparkles } from "lucide-react";
+import { Film, Image as ImageIcon, Music, Plus, Trash2, FolderOpen, Play, Pause, Sparkles, Volume2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { assetFromPath, baseName, formatTime, naturalCompare } from "@/lib/editor/media";
 import { makeClip, useEditor } from "@/lib/editor/store";
-import { projectDuration } from "@/lib/editor/render";
 import type { MediaAsset, TrackKind } from "@/lib/editor/types";
 
 /** Largest batch we probe at once, so the UI never locks up on a big import. */
@@ -97,6 +96,18 @@ export function ImportPanel() {
     await ingest(paths);
   }, [ingest]);
 
+  /** Shared drop-into-panel handler for both the import bar and the empty state. */
+  const acceptDroppedFiles = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    // Electron 37 dropped `File.path`; the preload resolves real paths via webUtils.
+    const getPath = window.zf?.files?.getPathForFile;
+    const paths = getPath ? files.map((f) => getPath(f)).filter(Boolean) : [];
+    if (paths.length) void ingest(paths);
+    else toast.error("Could not read those files — use Click to import instead");
+  };
+
   const trackFor = (kind: TrackKind) =>
     state.tracks.find((t) => t.kind === kind)?.id ?? state.tracks[0].id;
 
@@ -161,11 +172,13 @@ export function ImportPanel() {
     );
 
   return (
-    <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1">
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto pr-1">
+      {/* Compact one-row import action — the old tall drop zone made repeated
+          imports push the library down. Still accepts file drops directly. */}
       <button
         className={cn(
-          "rounded-lg border-2 border-dashed border-border p-5 text-center transition-colors cursor-pointer",
-          dragOver ? "border-primary bg-primary/10" : "hover:border-primary/60",
+          "flex w-full cursor-pointer items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-left transition-colors",
+          dragOver ? "border-primary bg-primary/10" : "border-border hover:border-primary/60",
         )}
         onClick={pickFiles}
         onDragOver={(e) => {
@@ -173,22 +186,17 @@ export function ImportPanel() {
           setDragOver(true);
         }}
         onDragLeave={() => setDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragOver(false);
-          const files = Array.from(e.dataTransfer.files);
-          // Electron 37 dropped `File.path`; the preload resolves real paths via webUtils.
-          const getPath = window.zf?.files?.getPathForFile;
-          const paths = getPath ? files.map((f) => getPath(f)).filter(Boolean) : [];
-          if (paths.length) void ingest(paths);
-          else toast.error("Could not read those files — use Click to import instead");
-        }}
+        onDrop={acceptDroppedFiles}
       >
-        <FolderOpen className="mx-auto size-6 text-muted-foreground" />
-        <p className="mt-2 text-sm font-medium">{busy ? "Reading files…" : "Click to import media"}</p>
-        <p className="text-xs text-muted-foreground">
-          Video, images and audio from your PC — MP4, MOV, MKV, PNG, JPG, MP3, WAV…
-        </p>
+        <FolderOpen className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-xs font-medium">
+            {busy ? "Reading files…" : "Import media"}
+          </span>
+          <span className="block truncate text-[10px] text-muted-foreground">
+            Click or drop files — MP4, MOV, MKV, PNG, JPG, MP3, WAV…
+          </span>
+        </span>
       </button>
 
       {state.assets.length > 0 && (
@@ -212,7 +220,11 @@ export function ImportPanel() {
         </div>
       )}
 
-      <div className="space-y-1.5">
+      {/* Auto-fill thumbnail grid: ~76px cards so 3-4 assets share a row even
+          at the default side-panel width, and the column count self-adjusts as
+          the panel is resized — viewport breakpoints can't see the container
+          width, so the panel being user-resizable rules them out. */}
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(76px,1fr))] gap-1.5">
         {state.assets.map((asset) => (
           <div
             key={asset.id}
@@ -222,9 +234,9 @@ export function ImportPanel() {
               e.dataTransfer.effectAllowed = "copy";
             }}
             onDoubleClick={() => appendAsset(asset)}
-            className="group flex cursor-grab items-center gap-2 rounded-md border border-border bg-panel-raised p-1.5 active:cursor-grabbing hover:border-primary/40 transition-colors"
+            className="group flex cursor-grab flex-col rounded-md border border-border bg-panel-raised p-1 active:cursor-grabbing hover:border-primary/40 transition-colors"
           >
-            <div className="relative flex size-10 shrink-0 items-center justify-center overflow-hidden rounded bg-rail text-muted-foreground">
+            <div className="relative flex aspect-video w-full items-center justify-center overflow-hidden rounded bg-rail text-muted-foreground">
               {asset.thumb ? (
                 <img
                   src={asset.thumb}
@@ -239,7 +251,7 @@ export function ImportPanel() {
                 icon(asset.kind)
               )}
 
-              {/* For audio, show play overlay on the thumbnail */}
+              {/* Audio: play/pause lives on the thumbnail */}
               {asset.kind === "audio" && (
                 <button
                   type="button"
@@ -248,10 +260,13 @@ export function ImportPanel() {
                     toggleAudioPreview(asset);
                   }}
                   className={cn(
-                    "absolute inset-0 flex items-center justify-center bg-black/45 transition-opacity",
-                    playingAudioId === asset.id ? "opacity-100 bg-primary/70 text-primary-foreground" : "opacity-0 group-hover:opacity-100 text-white"
+                    "absolute inset-0 flex items-center justify-center transition-opacity",
+                    playingAudioId === asset.id
+                      ? "bg-primary/70 text-primary-foreground opacity-100"
+                      : "bg-black/45 text-white opacity-0 group-hover:opacity-100",
                   )}
                   title={playingAudioId === asset.id ? "Pause" : "Listen"}
+                  aria-label={playingAudioId === asset.id ? "Pause preview" : "Listen to audio preview"}
                 >
                   {playingAudioId === asset.id ? (
                     <Pause className="size-4 animate-pulse" />
@@ -262,67 +277,102 @@ export function ImportPanel() {
               )}
             </div>
 
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-xs font-medium" title={asset.path}>
-                {asset.name}
-              </p>
-              <div className="flex items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
-                <span className="capitalize">{asset.kind}</span>
-                {asset.kind === "overlay" ? "" : <span>· {formatTime(asset.duration)}</span>}
-                {asset.kind === "image" || asset.kind === "video"
-                  ? <span>· {asset.width}×{asset.height}</span>
-                  : ""}
-                {asset.kind === "video" && asset.hasAudio ? <span>· ♪</span> : ""}
-              </div>
+            <p className="mt-1 truncate px-0.5 text-[10px] font-medium" title={asset.path}>
+              {asset.name}
+            </p>
+
+            <div
+              className="truncate px-0.5 font-mono text-[9px] leading-3 text-muted-foreground"
+              title={[
+                asset.kind,
+                asset.kind === "overlay" ? "" : formatTime(asset.duration),
+                asset.kind === "image" || asset.kind === "video" ? `${asset.width}×${asset.height}` : "",
+                asset.kind === "video" && asset.hasAudio ? "has audio" : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            >
+              <span className="capitalize">{asset.kind}</span>
+              {asset.kind === "overlay" ? "" : <span> · {formatTime(asset.duration)}</span>}
+              {asset.kind === "image" || asset.kind === "video" ? (
+                <span> · {asset.width}×{asset.height}</span>
+              ) : ""}
+              {asset.kind === "video" && asset.hasAudio ? (
+                <span className="inline-flex items-center gap-0.5 align-[-1px]" title="Has audio track">
+                  <Volume2 className="size-2.5" aria-label="Has audio track" />
+                </span>
+              ) : ""}
             </div>
 
-            {asset.kind === "audio" && (
+            <div className="mt-0.5 flex items-center justify-end gap-0.5">
+              {asset.kind === "audio" && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className={cn(
+                    "size-5 shrink-0",
+                    playingAudioId === asset.id ? "text-primary" : "text-muted-foreground",
+                  )}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleAudioPreview(asset);
+                  }}
+                  title={playingAudioId === asset.id ? "Pause audio" : "Play audio"}
+                >
+                  {playingAudioId === asset.id ? (
+                    <Pause className="size-3 fill-current" />
+                  ) : (
+                    <Play className="size-3 ml-px fill-current" />
+                  )}
+                </Button>
+              )}
               <Button
                 size="icon"
                 variant="ghost"
-                className={cn(
-                  "size-7 shrink-0",
-                  playingAudioId === asset.id ? "text-primary" : "text-muted-foreground"
-                )}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleAudioPreview(asset);
-                }}
-                title={playingAudioId === asset.id ? "Pause audio" : "Play audio"}
+                className="size-5 shrink-0 opacity-70 group-hover:opacity-100 hover:text-primary"
+                onClick={() => appendAsset(asset)}
+                title="Add to timeline"
               >
-                {playingAudioId === asset.id ? (
-                  <Pause className="size-3.5 fill-current" />
-                ) : (
-                  <Play className="size-3.5 ml-0.5 fill-current" />
-                )}
+                <Plus className="size-3" />
               </Button>
-            )}
-
-            <Button
-              size="icon"
-              variant="ghost"
-              className="size-7 opacity-70 group-hover:opacity-100 hover:text-primary shrink-0"
-              onClick={() => appendAsset(asset)}
-              title="Add to timeline"
-            >
-              <Plus className="size-3.5" />
-            </Button>
-            <Button
-              size="icon"
-              variant="ghost"
-              className="size-7 opacity-0 group-hover:opacity-100 hover:text-destructive shrink-0"
-              onClick={() => removeAsset(asset.id)}
-              title="Remove"
-            >
-              <Trash2 className="size-3.5" />
-            </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="size-5 shrink-0 opacity-0 group-hover:opacity-100 hover:text-destructive"
+                onClick={() => removeAsset(asset.id)}
+                title="Remove"
+              >
+                <Trash2 className="size-3" />
+              </Button>
+            </div>
           </div>
         ))}
 
         {state.assets.length === 0 && (
-          <p className="px-1 text-xs text-muted-foreground">
-            Nothing imported yet. Timeline length: {formatTime(projectDuration(state.clips))}
-          </p>
+          /* Empty state fills the leftover panel height so it reads as a real
+             drop zone instead of a stray sentence at the bottom. */
+          <button
+            type="button"
+            onClick={pickFiles}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={acceptDroppedFiles}
+            className={cn(
+              "group flex min-h-28 flex-1 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-4 py-8 text-center transition-colors",
+              dragOver ? "border-primary bg-primary/10" : "border-border hover:border-primary/60 hover:bg-panel-raised/50",
+            )}
+          >
+            <div className="mb-1 flex size-11 items-center justify-center rounded-full bg-rail text-muted-foreground transition-colors group-hover:text-primary">
+              <FolderOpen className="size-5" />
+            </div>
+            <span className="text-sm font-medium">Nothing imported yet</span>
+            <span className="text-xs text-muted-foreground">
+              Drop files here or click to import — video, image, or audio
+            </span>
+          </button>
         )}
       </div>
     </div>

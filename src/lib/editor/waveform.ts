@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
  * asset, so dragging a clip around never re-decodes the source audio.
  */
 const BUCKETS = 4096;
+/** Bounded so a very long session can't accumulate peaks for every URL ever loaded. */
+const CACHE_LIMIT = 64;
 const cache = new Map<string, number[] | null>();
 const pending = new Map<string, Promise<number[] | null>>();
 
@@ -57,6 +59,12 @@ export function loadWaveform(url: string): Promise<number[] | null> {
       // decodeAudioData detaches the buffer, so hand it a private copy.
       const decoded = await ctx.decodeAudioData(bytes.slice(0));
       const peaks = peaksFrom(decoded);
+      if (cache.size >= CACHE_LIMIT) {
+        // Map preserves insertion order, so deleting the first key evicts the
+        // oldest entry.
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+      }
       cache.set(url, peaks);
       return peaks;
     } catch (error) {

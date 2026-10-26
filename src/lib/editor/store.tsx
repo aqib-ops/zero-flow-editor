@@ -27,6 +27,11 @@ const defaultTracks: Track[] = [
   { id: "t-audio", kind: "audio", name: "Audio 1" },
 ];
 
+// Canonical order of the kind blocks on the timeline, top row → bottom row:
+// text sits in front, overlays stack above the main video, audio is the
+// bottom row. addTrack restores this order whenever it inserts a layer.
+const KIND_BLOCK_ORDER: TrackKind[] = ["text", "overlay", "video", "audio"];
+
 const initialState: EditorState = {
   assets: [],
   tracks: defaultTracks,
@@ -292,7 +297,15 @@ function sanitizeClips(
             lineHeight: clampNumber(candidate.lineHeight, 0.5, 3, 1.18),
           }
         : {}),
-      ...(overlay ? { overlay } : {}),
+      ...(overlay
+        ? {
+            overlay,
+            overlayX: clampNumber(candidate.overlayX, 0, 1, 0.5),
+            overlayY: clampNumber(candidate.overlayY, 0, 1, 0.5),
+            overlayScale: clampNumber(candidate.overlayScale, 0.05, 4, 1),
+            overlayRotation: clampNumber(candidate.overlayRotation, -180, 180, 0),
+          }
+        : {}),
     });
   }
 
@@ -419,7 +432,9 @@ interface Ctx {
   select: (ids: string[]) => void;
   setPlayhead: (t: number) => void;
   setPlaying: (p: boolean) => void;
-  addTrack: (kind: TrackKind) => string;
+  addTrack: (kind: TrackKind, at?: "start" | "end") => string;
+  moveTrack: (id: string, direction: "up" | "down") => void;
+  removeTrack: (id: string) => void;
   setAspectRatio: (ratio: EditorState["settings"]["aspectRatio"]) => void;
   loadProject: (data: Partial<EditorState>) => void;
   undo: () => void;
@@ -684,18 +699,28 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
           const leftDur = time - c.start;
           const ratio = Math.min(1, Math.max(0, leftDur / Math.max(0.001, c.duration)));
           const [leftText, rightText] =
-            c.kind === "text" ? splitTextAtBoundary(c.text ?? "", ratio) : [c.text, c.text];
-          pieces.push({ ...c, duration: leftDur, text: leftText });
-          pieces.push({
-            ...c,
-            id: uid(),
-            start: time,
-            duration: c.duration - leftDur,
-            offset: c.offset + leftDur * c.speed,
-            transition: "none",
-            text: rightText,
-          });
+            c.kind === "text"
+              ? splitTextAtBoundary(c.text ?? "", ratio)
+              : [c.text ?? "", c.text ?? ""];
+          // A single-word caption splits into a real left piece and an empty
+          // right one; the empty half would sit on the timeline rendering
+          // nothing, so it is dropped instead of created.
+          if (c.kind !== "text" || leftText.trim()) {
+            pieces.push({ ...c, duration: leftDur, text: leftText });
+          }
+          if (c.kind !== "text" || rightText.trim()) {
+            pieces.push({
+              ...c,
+              id: uid(),
+              start: time,
+              duration: c.duration - leftDur,
+              offset: c.offset + leftDur * c.speed,
+              transition: "none",
+              text: rightText,
+            });
+          }
         }
+        if (pieces.length === 0) return s;
         return { ...s, clips: [...rest, ...pieces], selectedClipIds: [] };
       }),
     [update],
@@ -711,24 +736,99 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
   const setPlaying = useCallback((p: boolean) => set((s) => ({ ...s, playing: p })), []);
 
   const addTrack = useCallback(
-    (kind: TrackKind) => {
+    (kind: TrackKind, at: "start" | "end" = "end") => {
       const id = "t-" + uid();
-      update((s) => {
-        const count = s.tracks.filter((t) => t.kind === kind).length;
-        const position = s.tracks.findIndex((t) => t.kind === kind);
-        const track: Track = {
-          id,
-          kind,
-          name: `${kind[0].toUpperCase() + kind.slice(1)} ${count + 1}`,
-        };
-        const tracks = [...s.tracks];
-        // insert right after the last track of the same kind
-        if (position >= 0) tracks.splice(position + count, 0, track);
-        else tracks.push(track);
-        return { ...s, tracks };
-      });
+      update(
+        (s) => {
+          const count = s.tracks.filter((t) => t.kind === kind).length;
+          const track: Track = { id, kind, name: "" };
+          let tracks = [...s.tracks];
+          const firstIdx = s.tracks.findIndex((t) => t.kind === kind);
+          if (firstIdx < 0) {
+            tracks.push(track);
+          } else if (at === "start") {
+            // Insert above the block so the new track sits in front.
+            tracks.splice(firstIdx, 0, track);
+          } else {
+            // Insert right after the last track of the same kind.
+            tracks.splice(firstIdx + count, 0, track);
+          }
+          // Every kind block must sit in its canonical row position. When the
+          // last track of a kind was deleted, the block vanished from the
+          // list, so the naive append above used to place the re-added layer
+          // at the very bottom (below audio). The stable sort puts the block
+          // back in its canonical slot — and is a no-op on an already
+          // canonical list, preserving the intra-block order for the "start"
+          // / "end" placements.
+          tracks.sort(
+            (a, b) =>
+              KIND_BLOCK_ORDER.indexOf(a.kind) - KIND_BLOCK_ORDER.indexOf(b.kind),
+          );
+          // Renumber so track names always match visual position.
+          const label = kind[0].toUpperCase() + kind.slice(1);
+          let n = 0;
+          tracks = tracks.map((t) =>
+            t.kind === kind ? { ...t, name: `${label} ${++n}` } : t,
+          );
+          return { ...s, tracks };
+        },
+        // Inside a drag gesture the track change is folded into the single
+        // history entry that endGesture() commits for the whole drag.
+        !gestureActive.current,
+      );
       return id;
     },
+    [update],
+  );
+
+  const moveTrack = useCallback(
+    (id: string, direction: "up" | "down") =>
+      update((s) => {
+        const index = s.tracks.findIndex((t) => t.id === id);
+        if (index < 0) return s;
+        const track = s.tracks[index];
+        // Swap with the adjacent track of the same kind so kind blocks stay
+        // contiguous — draw order is defined per kind block. Moving up brings
+        // the layer in front of the neighbour above it.
+        const targetIndex = direction === "up" ? index - 1 : index + 1;
+        const target = s.tracks[targetIndex];
+        if (!target || target.kind !== track.kind) return s;
+        let tracks = [...s.tracks];
+        tracks[index] = target;
+        tracks[targetIndex] = track;
+        // Renumber so track names always match visual position.
+        const label = track.kind[0].toUpperCase() + track.kind.slice(1);
+        let n = 0;
+        tracks = tracks.map((t) =>
+          t.kind === track.kind ? { ...t, name: `${label} ${++n}` } : t,
+        );
+        return { ...s, tracks };
+      }),
+    [update],
+  );
+
+  const removeTrack = useCallback(
+    (id: string) =>
+      update((s) => {
+        const track = s.tracks.find((t) => t.id === id);
+        if (!track) return s;
+        const removed = new Set(
+          s.clips.filter((c) => c.trackId === id).map((c) => c.id),
+        );
+        let tracks = s.tracks.filter((t) => t.id !== id);
+        // Renumber so track names always match visual position.
+        const label = track.kind[0].toUpperCase() + track.kind.slice(1);
+        let n = 0;
+        tracks = tracks.map((t) =>
+          t.kind === track.kind ? { ...t, name: `${label} ${++n}` } : t,
+        );
+        return {
+          ...s,
+          tracks,
+          clips: s.clips.filter((c) => c.trackId !== id),
+          selectedClipIds: s.selectedClipIds.filter((clipId) => !removed.has(clipId)),
+        };
+      }),
     [update],
   );
 
@@ -775,6 +875,8 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
       setPlayhead,
       setPlaying,
       addTrack,
+      moveTrack,
+      removeTrack,
       setAspectRatio,
       loadProject,
       undo,
@@ -785,7 +887,7 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
     [
       state, version, update, beginGesture, endGesture, addAssets, removeAsset, addClips,
       updateClip, updateClips, applyClipPatches, moveClip, removeClips, splitAt, select,
-      setPlayhead, setPlaying, addTrack, setAspectRatio, loadProject, undo, redo,
+      setPlayhead, setPlaying, addTrack, moveTrack, removeTrack, setAspectRatio, loadProject, undo, redo,
     ],
   );
 

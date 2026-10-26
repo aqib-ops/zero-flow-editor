@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, protocol } from "electron";
 import { join, dirname, extname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, readFileSync, writeFileSync, statSync, createReadStream } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, createReadStream, realpathSync } from "node:fs";
 import { Readable } from "node:stream";
 import { spawn } from "node:child_process";
 import {
@@ -11,7 +11,18 @@ import {
   cancelRender,
   isRendering,
 } from "./ffmpeg.js";
-import { findWhisperRuntime, DEFAULT_MODEL } from "./whisper.js";
+import { findWhisperRuntime, runtimeSearchRoot, isModelReady, DEFAULT_MODEL } from "./whisper.js";
+import { ensureWhisper, getSetupSnapshot, runSelfSetup, setSetupSink } from "./self-setup.js";
+import { clearSessionCache, startCacheSweeper } from "./session-cache.js";
+import {
+  deleteProject,
+  listProjects,
+  loadProject,
+  projectsDiskUsage,
+  saveProject,
+  sweepTempFiles,
+} from "./project-store.js";
+import type { SetupSnapshot } from "./preload-types.js";
 import {
   checkForUpdates,
   currentUpdateStatus,
@@ -40,11 +51,49 @@ protocol.registerSchemesAsPrivileged([
 
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// Dev launches `electron.exe dist-electron/main.js`, and dist-electron holds no
+// package.json for Electron to read — without this the dev profile lands in the
+// generic %APPDATA%\Electron. The packaged build already resolves its name from
+// package.json ("zero-flow-editor"), so this makes dev match it.
+if (!app.isPackaged) app.setName("zero-flow-editor");
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 let mainWindow: BrowserWindow | null = null;
 let activeEncode: Awaited<ReturnType<typeof startEncode>> | null = null;
 let encodeEnded = false;
+// Set once the user has confirmed abandoning a render, so the window's close
+// guard does not re-prompt while `app.quit()` tears the window down.
+let forceQuit = false;
+
+/**
+ * Ask before dropping an active export. Closing the window destroys the
+ * renderer that feeds frames over IPC, so the encode cannot finish once the
+ * last window is gone — the only honest options are keep working or cancel.
+ */
+function confirmAbandonRender(win: BrowserWindow): void {
+  void dialog
+    .showMessageBox(win, {
+      type: "warning",
+      buttons: ["Keep rendering", "Cancel render & quit"],
+      defaultId: 0,
+      cancelId: 0,
+      title: "Render in progress",
+      message: "A render is still running.",
+      detail: "Quitting now would leave the exported file incomplete.",
+    })
+    .then(({ response }) => {
+      if (response === 1) {
+        forceQuit = true;
+        cancelRender();
+        app.quit();
+      }
+    })
+    .catch(() => {
+      forceQuit = true;
+      app.quit();
+    });
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -74,6 +123,15 @@ function createWindow(): void {
   mainWindow.on("unmaximize", reportMax);
   mainWindow.on("restore", reportMax);
 
+  // Alt+F4 / taskbar close bypass `win:close` (the custom titlebar IPC), so
+  // guard the native event too — otherwise the renderer dies mid-export and
+  // the encoder waits forever for frames that can no longer arrive.
+  mainWindow.on("close", (event) => {
+    if (forceQuit || !isRendering()) return;
+    event.preventDefault();
+    confirmAbandonRender(mainWindow!);
+  });
+
   mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
     console.error(`[main] Failed to load ${url}: [${code}] ${desc}`);
   });
@@ -98,11 +156,14 @@ function createWindow(): void {
 app.whenReady().then(() => {
   const MEDIA_MIME: Record<string, string> = {
     mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", mkv: "video/x-matroska",
-    webm: "video/webm", avi: "video/x-msvideo", ts: "video/mp2t",
+    webm: "video/webm", avi: "video/x-msvideo", ts: "video/mp2t", m2ts: "video/mp2t",
+    mpg: "video/mpeg", mpeg: "video/mpeg", flv: "video/x-flv", wmv: "video/x-ms-wmv",
     mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac",
-    ogg: "audio/ogg", opus: "audio/opus", flac: "audio/flac",
+    ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/opus", flac: "audio/flac",
+    wma: "audio/x-ms-wma",
     png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
     gif: "image/gif", svg: "image/svg+xml", bmp: "image/bmp",
+    avif: "image/avif", tif: "image/tiff", tiff: "image/tiff",
   };
 
   /**
@@ -128,23 +189,42 @@ app.whenReady().then(() => {
         }
       }
 
-      if (!filePath || !existsSync(filePath)) {
+      if (!filePath) {
         return new Response("Media not found", { status: 404 });
       }
 
-      const stat = statSync(filePath);
+      // Resolve links before the allowlist below: a symlink/junction called
+      // "clip.mp4" must not be able to expose a non-media file just because of
+      // its name. The canonical path is what we stat and stream.
+      let realPath: string;
+      try {
+        realPath = realpathSync(filePath);
+      } catch {
+        return new Response("Media not found", { status: 404 });
+      }
+
+      const stat = statSync(realPath);
       if (!stat.isFile()) {
         return new Response("Not a file", { status: 404 });
       }
 
       const size = stat.size;
-      const ext = extname(filePath).replace(".", "").toLowerCase();
-      const mime = MEDIA_MIME[ext] || "application/octet-stream";
+      const ext = extname(realPath).replace(".", "").toLowerCase();
+      const mime = MEDIA_MIME[ext];
+      // The scheme is registered with bypassCSP and the renderer runs with
+      // webSecurity disabled, so a known-media extension allowlist is the only
+      // thing stopping "zf-media:///…/id_rsa" from becoming a file read.
+      if (!mime) {
+        return new Response("Unsupported media type", { status: 415 });
+      }
       const baseHeaders: Record<string, string> = {
         "Content-Type": mime,
         "Accept-Ranges": "bytes",
         "Last-Modified": stat.mtime.toUTCString(),
         "Cache-Control": "no-cache",
+        // Canvas readback (thumbnails, export frames) requires an un-tainted
+        // source; the scheme is registered corsEnabled, so opt in explicitly.
+        "Access-Control-Allow-Origin": "*",
       };
 
       const rangeHeader = request.headers.get("range");
@@ -181,7 +261,7 @@ app.whenReady().then(() => {
         end = Math.min(end, size - 1);
 
         const body = Readable.toWeb(
-          createReadStream(filePath, { start, end }),
+          createReadStream(realPath, { start, end }),
         ) as ReadableStream;
         return new Response(body, {
           status: 206,
@@ -193,7 +273,7 @@ app.whenReady().then(() => {
         });
       }
 
-      const full = Readable.toWeb(createReadStream(filePath)) as ReadableStream;
+      const full = Readable.toWeb(createReadStream(realPath)) as ReadableStream;
       return new Response(full, {
         status: 200,
         headers: { ...baseHeaders, "Content-Length": String(size) },
@@ -211,11 +291,28 @@ app.whenReady().then(() => {
 
   // Silent background check so Settings → Updates has a state on first open.
   startAutoUpdates(send);
+
+  // Self-setup: if the shipped FFmpeg/captioning runtime is missing, download
+  // it in the background (one-time) and stream progress to the renderer so a
+  // fresh machine works with zero manual steps. Never blocks the editor.
+  setSetupSink((status) => send("setup:status", status));
+  void runSelfSetup();
+
+  // Derived caches (HTTP, code, GPU, shader) are wiped after every export and
+  // on quit. Local Storage is kept — it only ever holds a few bytes of UI prefs.
+  startCacheSweeper();
+
+  // Recent Projects: remove .tmp leftovers from any crashed autosave before
+  // the renderer asks for the list.
+  sweepTempFiles();
 });
 
 app.on("window-all-closed", () => {
-  // Never kill ffmpeg mid-encode: the output file would be truncated.
-  if (isRendering()) return;
+  // The renderer drives the frame pipeline over IPC, so once the last window is
+  // gone no more frames can arrive and a running encode can never finish. Stop
+  // ffmpeg before exiting instead of leaving a headless process waiting on a
+  // stdin that will never close.
+  if (isRendering()) cancelRender();
   app.quit();
 });
 
@@ -224,33 +321,6 @@ const send = (channel: string, ...args: unknown[]): void => {
 };
 
 /* --------------------------------- IPC ------------------------------------- */
-
-ipcMain.handle("media:to-data-url", async (_e, filePath: string) => {
-  if (!filePath || !existsSync(filePath)) return null;
-  try {
-    const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-    const mimeMap: Record<string, string> = {
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      webp: "image/webp",
-      gif: "image/gif",
-      svg: "image/svg+xml",
-      bmp: "image/bmp",
-      mp3: "audio/mpeg",
-      wav: "audio/wav",
-      ogg: "audio/ogg",
-      m4a: "audio/mp4",
-      flac: "audio/flac",
-    };
-    const mime = mimeMap[ext] || "application/octet-stream";
-    const data = readFileSync(filePath);
-    return `data:${mime};base64,${data.toString("base64")}`;
-  } catch (err) {
-    console.error("[media:to-data-url error]", err);
-    return null;
-  }
-});
 
 ipcMain.handle("ff:find-binaries", () => findBinaries());
 
@@ -273,7 +343,9 @@ ipcMain.handle("app:engine", async () => {
   const binaries = await findBinaries();
   const runtime = findWhisperRuntime();
   const modelDir = runtime ? join(runtime.modelRoot, DEFAULT_MODEL) : null;
-  const modelReady = !!modelDir && existsSync(join(modelDir, "model.bin"));
+  // Partial folders (model.bin only) are NOT ready: transcribe.py would fall
+  // back to a network download that cannot succeed offline.
+  const modelReady = isModelReady(runtime?.modelRoot ?? null);
   return {
     ffmpeg: { path: binaries.ffmpeg, source: binaries.source },
     captions: {
@@ -293,6 +365,19 @@ ipcMain.handle("app:open-external", (_e, url: string) => {
   // Only ever hand http(s) to the OS browser.
   if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
 });
+
+/** Called by the renderer after a successful export. */
+ipcMain.handle("cache:clear", () => clearSessionCache());
+
+/* ------------------------------ recent projects ----------------------------- */
+
+ipcMain.handle("proj:list", () => listProjects());
+ipcMain.handle("proj:load", (_e, id: string) => loadProject(id));
+ipcMain.handle("proj:save", (_e, id: string, name: string, data: unknown) =>
+  saveProject(id, name, data),
+);
+ipcMain.handle("proj:delete", (_e, id: string) => deleteProject(id));
+ipcMain.handle("proj:usage", () => projectsDiskUsage());
 
 ipcMain.handle("dlg:open-media", async () => {
   const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
@@ -328,21 +413,32 @@ ipcMain.handle("dlg:open-script", async () => {
   return { path: p, text: readFileSync(p, "utf8") };
 });
 
+/** Snapshot of the background self-setup, for the renderer to render on mount. */
+ipcMain.handle("setup:status", async (): Promise<SetupSnapshot> => getSetupSnapshot());
+
 ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model?: string) => {
   if (!mediaPath || !existsSync(mediaPath)) {
     return { ok: false, error: `Media file not found: ${mediaPath}` };
   }
 
-  const runtime = findWhisperRuntime();
+  // Self-heal: a missing runtime triggers the same download the startup
+  // self-setup uses (no-op when it is already running or the runtime exists).
+  let runtime = findWhisperRuntime();
+  if (!runtime && (await ensureWhisper())) runtime = findWhisperRuntime();
   if (!runtime) {
     return {
       ok: false,
       error:
-        "The captioning engine is not installed. Run `npm run setup:whisper` once, or reinstall the app.",
+        `The captioning engine could not be installed (looked in ${runtimeSearchRoot()}). ` +
+        "Check your internet connection and try again, or reinstall the app.",
     };
   }
 
   const modelSize = model && model !== "auto" ? model : DEFAULT_MODEL;
+
+  // A hang (huge file, locked media, a broken interpreter) must not leave the
+  // renderer spinning forever — there is no cancel button on the dialog.
+  const WHISPER_TIMEOUT_MS = 15 * 60 * 1000;
 
   return new Promise((resolve) => {
     const py = spawn(runtime.python, [runtime.script, mediaPath, modelSize, runtime.modelRoot], {
@@ -350,6 +446,33 @@ ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model?: strin
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+
+    const settle = (value: {
+      ok: boolean;
+      segments?: Array<{ start: number; end: number; duration: number; text: string }>;
+      language?: string;
+      duration?: number;
+      error?: string;
+    }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    };
+
+    const timeout = setTimeout(() => {
+      try {
+        py.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      settle({
+        ok: false,
+        error: `Captioning timed out after ${Math.round(WHISPER_TIMEOUT_MS / 60000)} minutes. ` +
+          "Try a shorter clip.",
+      });
+    }, WHISPER_TIMEOUT_MS);
 
     py.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -359,29 +482,46 @@ ipcMain.handle("whisper:transcribe", async (_e, mediaPath: string, model?: strin
     });
 
     py.on("close", (code) => {
-      if (code !== 0 && !stdout) {
-        resolve({ ok: false, error: stderr.trim() || `Whisper exited with code ${code}` });
-        return;
-      }
-      try {
-        const trimmed = stdout.trim();
-        const start = trimmed.indexOf("{");
-        const end = trimmed.lastIndexOf("}");
-        if (start !== -1 && end !== -1 && end > start) {
-          const jsonStr = trimmed.slice(start, end + 1);
-          const parsed = JSON.parse(jsonStr);
-          resolve(parsed);
+      const trimmed = stdout.trim();
+      const start = trimmed.indexOf("{");
+      const end = trimmed.lastIndexOf("}");
+      if (start !== -1 && end > start) {
+        try {
+          const parsed = JSON.parse(trimmed.slice(start, end + 1));
+          // The script emits {"ok": false, "error": ...} on its own failures.
+          // Honour that even when the process exited 0, otherwise a failed run
+          // that printed a payload is reported as a success.
+          if (parsed && typeof parsed === "object" && parsed.ok === false) {
+            settle({
+              ok: false,
+              error:
+                typeof parsed.error === "string" && parsed.error
+                  ? parsed.error
+                  : `Whisper exited with code ${code}`,
+            });
+            return;
+          }
+          settle(parsed);
+          return;
+        } catch (err) {
+          settle({
+            ok: false,
+            error: `Whisper parse error: ${(err as Error).message}\n${stdout || stderr}`,
+          });
           return;
         }
-        const parsed = JSON.parse(trimmed);
-        resolve(parsed);
-      } catch (err) {
-        resolve({ ok: false, error: `Whisper parse error: ${(err as Error).message}\n${stdout || stderr}` });
       }
+      settle({
+        ok: false,
+        error:
+          stderr.trim() ||
+          `Whisper exited with code ${code}` ||
+          "The captioning engine produced no output.",
+      });
     });
 
     py.on("error", (err) => {
-      resolve({
+      settle({
         ok: false,
         error: `Failed to launch the captioning engine (${runtime.python}): ${err.message}`,
       });
@@ -397,51 +537,55 @@ ipcMain.handle("shell:open-folder", (_e, filePath: string) => {
   return false;
 });
 
-ipcMain.handle("dlg:save-video", async (_e, defaultName: string) => {
+ipcMain.handle("dlg:save-video", async (_e, defaultName: string, format?: string) => {
   const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
   if (!win) return null;
+  // The filter follows the format chosen in the export dialog so the default
+  // extension always matches what the encoder will actually write.
+  const filters =
+    format === "mov"
+      ? [{ name: "QuickTime MOV", extensions: ["mov"] }]
+      : format === "mkv"
+        ? [{ name: "Matroska MKV", extensions: ["mkv"] }]
+        : format === "mp4"
+          ? [{ name: "MP4 (H.264 + AAC)", extensions: ["mp4"] }]
+          : [
+              { name: "MP4 (H.264 + AAC)", extensions: ["mp4"] },
+              { name: "QuickTime MOV", extensions: ["mov"] },
+              { name: "Matroska MKV", extensions: ["mkv"] },
+            ];
   const res = await dialog.showSaveDialog(win, {
     title: "Export video",
     defaultPath: defaultName,
     properties: ["createDirectory", "showOverwriteConfirmation"],
-    filters: [
-      { name: "MP4 (H.264 + AAC)", extensions: ["mp4"] },
-      { name: "QuickTime MOV", extensions: ["mov"] },
-      { name: "Matroska MKV", extensions: ["mkv"] },
-    ],
+    filters,
   });
   return res.canceled || !res.filePath ? null : res.filePath;
 });
 
-ipcMain.handle("proj:write", async (_e, data: unknown) => {
+ipcMain.handle("text:save", async (_e, req: { defaultName: string; content: string }) => {
   const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
   if (!win) return null;
+  const defaultName =
+    req && typeof req.defaultName === "string" && req.defaultName.trim()
+      ? req.defaultName.trim()
+      : "transcript.txt";
+  const content = req && typeof req.content === "string" ? req.content : "";
+  const isSrt = /\.srt$/i.test(defaultName);
   const res = await dialog.showSaveDialog(win, {
-    title: "Save project",
-    defaultPath: "zero-flow-project.zfp",
+    title: "Save transcript",
+    defaultPath: defaultName,
     properties: ["createDirectory", "showOverwriteConfirmation"],
-    filters: [{ name: "Zero Flow project", extensions: ["zfp","json"] }],
+    filters: isSrt
+      ? [{ name: "SubRip subtitles", extensions: ["srt"] }]
+      : [
+          { name: "Text file", extensions: ["txt"] },
+          { name: "SubRip subtitles", extensions: ["srt"] },
+        ],
   });
   if (res.canceled || !res.filePath) return null;
-  writeFileSync(res.filePath, JSON.stringify(data, null, 2), "utf8");
+  writeFileSync(res.filePath, content, "utf8");
   return res.filePath;
-});
-
-ipcMain.handle("proj:read", (_e, path: string) => {
-  if (!existsSync(path)) throw new Error(`File not found: ${path}`);
-  return JSON.parse(readFileSync(path, "utf8"));
-});
-
-ipcMain.handle("proj:open-project", async () => {
-  const win = BrowserWindow.getFocusedWindow() ?? mainWindow;
-  if (!win) return null;
-  const res = await dialog.showOpenDialog(win, {
-    title: "Open project",
-    properties: ["openFile"],
-    filters: [{ name: "Zero Flow project", extensions: ["zfp","json"] }],
-  });
-  if (res.canceled || !res.filePaths[0]) return null;
-  return JSON.parse(readFileSync(res.filePaths[0], "utf8"));
 });
 
 ipcMain.handle("win:minimize", () => mainWindow?.minimize());
@@ -456,27 +600,13 @@ ipcMain.handle("win:toggle-maximize", () => {
 ipcMain.handle("win:is-maximized", () => mainWindow?.isMaximized() ?? false);
 
 ipcMain.handle("win:close", () => {
+  const win = mainWindow;
+  if (!win) return;
   if (isRendering()) {
-    void dialog
-      .showMessageBox(mainWindow!, {
-        type: "warning",
-        buttons: ["Keep rendering", "Cancel render & quit"],
-        defaultId: 0,
-        cancelId: 0,
-        title: "Render in progress",
-        message: "A render is still running.",
-        detail: "Quitting now would leave the exported file incomplete.",
-      })
-      .then(({ response }) => {
-        if (response === 1) {
-          cancelRender();
-          setTimeout(() => app.quit(), 150);
-        }
-      })
-      .catch(() => app.quit());
+    confirmAbandonRender(win);
     return;
   }
-  mainWindow?.close();
+  win.close();
 });
 
 /* ------------------------------ render pipeline ----------------------------- */
@@ -485,7 +615,7 @@ ipcMain.handle(
   "render:start",
   async (
     _e,
-    req: { width: number; height: number; fps: number; bitrateMbps: number; outputPath: string; audio: AudioTrackSpec[] },
+    req: { width: number; height: number; fps: number; bitrateMbps: number; outputPath: string; format: "mp4" | "mov" | "mkv"; audio: AudioTrackSpec[] },
   ) => {
     if (activeEncode) return { ok: false, error: "A render is already running." };
     encodeEnded = false;
@@ -496,6 +626,7 @@ ipcMain.handle(
         fps: req.fps,
         bitrateMbps: req.bitrateMbps,
         outputPath: req.outputPath,
+        format: req.format,
         audio: req.audio,
         onProgress: (p) => send("render:progress", p),
       });

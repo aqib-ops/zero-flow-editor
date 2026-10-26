@@ -201,6 +201,65 @@ export function ClipInspector() {
         )}
       </section>
 
+      {clip.kind === "overlay" && clip.overlay && clip.overlay.type !== "builtin" && (
+        <section className="space-y-2">
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Transform
+          </p>
+          <Slider
+            label="Size"
+            value={clip.overlayScale ?? 1}
+            display={`${Math.round((clip.overlayScale ?? 1) * 100)}%`}
+            min={0.05}
+            max={4}
+            step={0.05}
+            onChange={(v) => change("overlayScale", v)}
+          />
+          <Slider
+            label="Rotation"
+            value={clip.overlayRotation ?? 0}
+            display={`${Math.round(clip.overlayRotation ?? 0)}°`}
+            min={-180}
+            max={180}
+            step={1}
+            onChange={(v) => change("overlayRotation", v)}
+          />
+          <Slider
+            label="Position X"
+            value={clip.overlayX ?? 0.5}
+            display={`${Math.round((clip.overlayX ?? 0.5) * 100)}%`}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={(v) => change("overlayX", v)}
+          />
+          <Slider
+            label="Position Y"
+            value={clip.overlayY ?? 0.5}
+            display={`${Math.round((clip.overlayY ?? 0.5) * 100)}%`}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={(v) => change("overlayY", v)}
+          />
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 w-full"
+            onClick={() =>
+              updateClip(clip.id, {
+                overlayX: 0.5,
+                overlayY: 0.5,
+                overlayScale: 1,
+                overlayRotation: 0,
+              })
+            }
+          >
+            Reset transform
+          </Button>
+        </section>
+      )}
+
       {(clip.kind === "video" || clip.kind === "overlay") && (
         <section className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">

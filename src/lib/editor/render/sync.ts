@@ -8,9 +8,14 @@ import {
 } from "./scene";
 
 const warned = new Set<string>();
+const WARNED_LIMIT = 200;
 
 function warnOnce(key: string, error: unknown) {
   if (warned.has(key)) return;
+  // Bound the set so a pathological session (thousands of distinct failing
+  // sources) can't grow it without limit; the first 200 warnings are plenty
+  // for diagnosis.
+  if (warned.size >= WARNED_LIMIT) warned.clear();
   warned.add(key);
   console.warn(`[render] ${key}`, error);
 }

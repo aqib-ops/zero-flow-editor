@@ -94,5 +94,35 @@ export interface RenderRequest {
   fps: number;
   bitrateMbps: number;
   outputPath: string;
+  /** Container chosen in the export dialog; the output path must match it. */
+  format: "mp4" | "mov" | "mkv";
   audio: AudioTrackSpec[];
+}
+
+/** Which engine a setup:status event is about. */
+export type SetupComponent = "ffmpeg" | "whisper";
+
+export type SetupPhase =
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "extracting"
+  | "installing"
+  | "ready"
+  | "error";
+
+/** Pushed over the `setup:status` channel whenever an engine's state changes. */
+export interface SetupStatus {
+  component: SetupComponent;
+  phase: SetupPhase;
+  detail?: string;
+  /** 0–100 while downloading, undefined otherwise. */
+  progress?: number;
+}
+
+/** Reply to the `setup:status` invoke — a snapshot of both engines. */
+export interface SetupSnapshot {
+  ffmpeg: SetupPhase;
+  whisper: SetupPhase;
+  message: string | null;
 }

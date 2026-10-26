@@ -16,6 +16,8 @@ export interface ExportSettings {
   fps: number;
   bitrateMbps: number;
   outputPath: string;
+  /** Container format; must match the output path's extension. */
+  format: "mp4" | "mov" | "mkv";
 }
 
 export interface ExportProgress {
@@ -253,6 +255,7 @@ export function exportVideo(
         fps,
         bitrateMbps: settings.bitrateMbps,
         outputPath: settings.outputPath,
+        format: settings.format,
         audio: collectAudioTracks(state),
       });
       if (!started.ok) {

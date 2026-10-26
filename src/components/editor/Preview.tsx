@@ -1,8 +1,19 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   getAudio,
   getVideo,
+  peekImage,
+  peekVideo,
   isAudioAsset,
+  isImageAsset,
   isVideoAsset,
 } from "@/lib/editor/media";
 import {
@@ -31,6 +42,7 @@ import {
   syncAudioElements,
   type RenderScene,
 } from "@/lib/editor/render";
+import { animationTransform, clamp01 } from "@/lib/editor/render/draw-utils";
 
 /**
  * Fits the canvas inside its container at the project's aspect ratio.
@@ -83,7 +95,8 @@ function useFittedCanvas(
 }
 
 export function Preview() {
-  const { state, setPlayhead, setPlaying, splitAt, removeClips, undo, redo } = useEditor();
+  const { state, setPlayhead, setPlaying, splitAt, removeClips, undo, redo, beginGesture, endGesture, updateClip } =
+    useEditor();
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef(state);
@@ -328,6 +341,197 @@ export function Preview() {
     return () => window.removeEventListener("keydown", onKey);
   }, [setPlaying, splitAt, removeClips, setPlayhead, undo, redo]);
 
+  // ---- On-canvas overlay editing (CapCut-style move / resize / rotate) ----
+  // The placement box only shows for a selected imported overlay while paused.
+  const overlayClip = useMemo(() => {
+    if (state.playing || width === 0) return null;
+    const t = state.playhead;
+    return (
+      state.clips.find(
+        (c) =>
+          c.kind === "overlay" &&
+          c.overlay &&
+          c.overlay.type !== "builtin" &&
+          state.selectedClipIds.includes(c.id) &&
+          t >= c.start &&
+          t < c.start + c.duration,
+      ) ?? null
+    );
+  }, [state.playing, state.playhead, state.clips, state.selectedClipIds, width]);
+
+  type OverlayDrag = {
+    mode: "move" | "resize" | "rotate";
+    id: string;
+    startX: number;
+    startY: number;
+    baseX: number;
+    baseY: number;
+    baseScale: number;
+    baseRot: number;
+    /** Overlay centre in CSS pixels at drag start. */
+    cx: number;
+    cy: number;
+    /**
+     * Corner-anchored resize: screen-space unit vector from the box centre
+     * toward the grabbed corner, the half-diagonal length at drag start, and
+     * (derived) the fixed opposite corner. Scale = |pointer − opposite| / 2r
+     * and the centre becomes the midpoint, so the opposite corner never moves.
+     */
+    corner?: { ux: number; uy: number; r: number };
+  };
+  const overlayDrag = useRef<OverlayDrag | null>(null);
+
+  const beginOverlayDrag = (mode: OverlayDrag["mode"], e: ReactPointerEvent<HTMLDivElement>) => {
+    const clip = overlayClip;
+    if (!clip) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const W = stateRef.current.settings.width;
+    const H = stateRef.current.settings.height;
+    const k = width / W;
+    const p = clamp01((stateRef.current.playhead - clip.start) / Math.max(0.001, clip.duration));
+    const anim = animationTransform(clip, p);
+    const x = clip.overlayX ?? 0.5;
+    const y = clip.overlayY ?? 0.5;
+    const cx = (x + anim.dx) * W * k;
+    const cy = (y + anim.dy) * H * k;
+
+    let corner: OverlayDrag["corner"];
+    if (mode === "resize") {
+      // The box div is CSS-rotated about its centre, so the centre of its
+      // axis-aligned bounding box is still the box centre; the pointer sits on
+      // a corner handle, giving the corner direction in screen space directly.
+      const box = e.currentTarget.getBoundingClientRect();
+      const hx = e.clientX - (box.left + box.width / 2);
+      const hy = e.clientY - (box.top + box.height / 2);
+      const r = Math.hypot(hx, hy) || 1;
+      corner = { ux: hx / r, uy: hy / r, r };
+    }
+
+    overlayDrag.current = {
+      mode,
+      id: clip.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseX: x,
+      baseY: y,
+      baseScale: Math.max(0.05, clip.overlayScale ?? 1),
+      baseRot: clip.overlayRotation ?? 0,
+      cx,
+      cy,
+      corner,
+    };
+    beginGesture();
+  };
+
+  const moveOverlayDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = overlayDrag.current;
+    if (!d) return;
+    const W = stateRef.current.settings.width;
+    const H = stateRef.current.settings.height;
+    const k = width / W;
+    if (d.mode === "move") {
+      updateClip(
+        d.id,
+        {
+          overlayX: clamp01(d.baseX + (e.clientX - d.startX) / (W * k)),
+          overlayY: clamp01(d.baseY + (e.clientY - d.startY) / (H * k)),
+        },
+        false,
+      );
+    } else if (d.mode === "resize" && d.corner) {
+      // Corner-anchored: the opposite corner (centre − r·u at drag start) stays
+      // fixed, the scale is the pointer-distance ratio, and the centre slides
+      // along the diagonal so the grabbed corner tracks the pointer. The
+      // overlay is aspect-locked, so perpendicular pointer drift is ignored.
+      // Same 0.05–4 window as the inspector slider and project loading.
+      const ox = d.cx - d.corner.r * d.corner.ux;
+      const oy = d.cy - d.corner.r * d.corner.uy;
+      const s = Math.hypot(e.clientX - ox, e.clientY - oy) / (2 * d.corner.r);
+      const scale = Math.min(4, Math.max(0.05, d.baseScale * s));
+      const ncx = ox + s * d.corner.r * d.corner.ux;
+      const ncy = oy + s * d.corner.r * d.corner.uy;
+      updateClip(
+        d.id,
+        {
+          overlayScale: scale,
+          overlayX: clamp01(d.baseX + (ncx - d.cx) / (W * k)),
+          overlayY: clamp01(d.baseY + (ncy - d.cy) / (H * k)),
+        },
+        false,
+      );
+    } else if (d.mode === "rotate") {
+      // Both canvas and screen y-axes point down, so the atan2 delta maps
+      // directly to clockwise rotation degrees. Unclamped mid-drag: the handle
+      // must keep spinning past half a turn instead of sticking at the wall,
+      // and the value is normalized back into -180..180 when the drag commits.
+      const startAngle = (Math.atan2(d.startY - d.cy, d.startX - d.cx) * 180) / Math.PI;
+      const angle = (Math.atan2(e.clientY - d.cy, e.clientX - d.cx) * 180) / Math.PI;
+      updateClip(d.id, { overlayRotation: d.baseRot + (angle - startAngle) }, false);
+    }
+  };
+
+  const endOverlayDrag = (commit: boolean) => {
+    const d = overlayDrag.current;
+    if (!d) return;
+    overlayDrag.current = null;
+    if (commit && d.mode === "rotate") {
+      // Fold the free-spun value back into -180..180 so the stored clip and the
+      // inspector slider stay in range (the renderer treats 270° and -90° alike).
+      const clip = stateRef.current.clips.find((c) => c.id === d.id);
+      if (clip) {
+        const raw = clip.overlayRotation ?? 0;
+        const normalized = ((((raw + 180) % 360) + 360) % 360) - 180;
+        if (normalized !== raw) updateClip(d.id, { overlayRotation: normalized }, false);
+      }
+    }
+    endGesture(commit);
+  };
+
+  // Geometry of the placement box, in CSS pixels, mirroring renderFrame's
+  // drawContainPlaced math (contain fit + pivot + rotation + animation).
+  //
+  // Computed in render but *without* touching the media caches: the source
+  // dimensions are read from already-cached elements only (getImage/getVideo
+  // can lazily create elements, and creating DOM as a render side effect is
+  // unsafe under StrictMode double-render). If the element isn't decoded yet,
+  // the box is skipped for this frame — the media-loaded listener below
+  // triggers a redraw that picks it up.
+  let overlayBox: { left: number; top: number; w: number; h: number; rot: number } | null = null;
+  if (overlayClip) {
+    const W = state.settings.width;
+    const H = state.settings.height;
+    const k = width / W;
+    const asset = resolveClipAsset(scene, overlayClip);
+    let sw = 0;
+    let sh = 0;
+    if (asset && isImageAsset(asset)) {
+      const img = peekImage(asset.url);
+      if (img && img.complete && img.naturalWidth) {
+        sw = img.naturalWidth;
+        sh = img.naturalHeight;
+      }
+    } else if (asset && isVideoAsset(asset)) {
+      const video = peekVideo(asset.url, `${scene.mediaOwnerPrefix}${overlayClip.id}`);
+      if (video && video.videoWidth) {
+        sw = video.videoWidth;
+        sh = video.videoHeight;
+      }
+    }
+    if (sw && sh) {
+      const p = clamp01((state.playhead - overlayClip.start) / Math.max(0.001, overlayClip.duration));
+      const anim = animationTransform(overlayClip, p);
+      const base = Math.min(W / sw, H / sh);
+      const mul = anim.scale * Math.max(0.05, overlayClip.overlayScale ?? 1) * k;
+      const w = sw * base * mul;
+      const h = sh * base * mul;
+      const cx = ((overlayClip.overlayX ?? 0.5) + anim.dx) * W * k;
+      const cy = ((overlayClip.overlayY ?? 0.5) + anim.dy) * H * k;
+      overlayBox = { left: cx - w / 2, top: cy - h / 2, w, h, rot: overlayClip.overlayRotation ?? 0 };
+    }
+  }
+
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-rail">
       <div
@@ -354,6 +558,56 @@ export function Preview() {
               <div className="absolute top-1/2 left-1/2 h-[80%] w-[90%] -translate-x-1/2 -translate-y-1/2 border border-dashed border-white/50" />
             </div>
           )}
+          {overlayBox && (
+            <div
+              className="absolute touch-none select-none"
+              style={{
+                left: overlayBox.left,
+                top: overlayBox.top,
+                width: overlayBox.w,
+                height: overlayBox.h,
+                transform: `rotate(${overlayBox.rot}deg)`,
+              }}
+              onPointerDown={(e) => {
+                const mode = (e.target as HTMLElement).dataset.mode;
+                if (mode === "move" || mode === "resize" || mode === "rotate") {
+                  beginOverlayDrag(mode, e);
+                }
+              }}
+              onPointerMove={moveOverlayDrag}
+              onPointerUp={() => endOverlayDrag(true)}
+              onPointerCancel={() => endOverlayDrag(false)}
+            >
+              {/* Body: drag anywhere inside to move */}
+              <div
+                data-mode="move"
+                className="absolute inset-0 border border-dashed border-primary/90"
+                style={{ cursor: "move" }}
+              />
+              {/* Rotation stem + handle above the top edge */}
+              <div className="pointer-events-none absolute top-0 left-1/2 h-4 w-px -translate-x-1/2 -translate-y-full bg-primary/80" />
+              <div
+                data-mode="rotate"
+                title="Drag to rotate"
+                className="absolute top-0 left-1/2 size-3 -translate-x-1/2 -translate-y-[28px] rounded-full border border-background bg-primary shadow"
+                style={{ cursor: "grab" }}
+              />
+              {/* Corner resize handles: drag outward/inward to scale */}
+              {[
+                { key: "nw", pos: { left: -6, top: -6 }, cursor: "nwse-resize" },
+                { key: "ne", pos: { right: -6, top: -6 }, cursor: "nesw-resize" },
+                { key: "sw", pos: { left: -6, bottom: -6 }, cursor: "nesw-resize" },
+                { key: "se", pos: { right: -6, bottom: -6 }, cursor: "nwse-resize" },
+              ].map(({ key, pos, cursor }) => (
+                <div
+                  key={key}
+                  data-mode="resize"
+                  className="absolute size-3 rounded-full border border-background bg-primary shadow"
+                  style={{ ...pos, cursor }}
+                />
+              ))}
+            </div>
+          )}
           {width === 0 && (
             <div className="absolute inset-0 grid place-items-center text-xs text-muted-foreground">
               {state.settings.width}×{state.settings.height}
@@ -362,7 +616,11 @@ export function Preview() {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border bg-panel px-3 py-2">
+      {/* shrink-0: when the timeline is expanded the canvas box (min-h-0 above)
+          yields first — this control bar must never be squeezed or its buttons
+          clip off the bottom edge. flex-wrap keeps every control reachable on
+          narrow windows. */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border bg-panel px-3 py-2">
         <div className="flex items-center gap-1">
           <Button size="icon" variant="ghost" onClick={() => setPlayhead(0)} title="Go to start (Home)">
             <SkipBack className="size-4" />

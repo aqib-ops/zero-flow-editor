@@ -125,9 +125,10 @@ export async function checkForUpdates(channel: Send): Promise<UpdateStatus> {
 export async function downloadUpdate(channel: Send): Promise<UpdateStatus> {
   send = channel;
   if (!app.isPackaged) return status;
-  if (status.phase !== "available" && status.phase !== "error") {
-    publish({ ...status, phase: "available" });
-  }
+  // Only an update the checker actually found is downloadable. Anything else
+  // (an error, a download already running, "not-available") must not be
+  // rewritten to "available" behind the UI's back.
+  if (status.phase !== "available") return status;
   publish({ phase: "downloading", percent: 0, version: status.version });
   try {
     const { autoUpdater } = await loadUpdater();

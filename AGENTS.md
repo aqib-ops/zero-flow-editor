@@ -30,12 +30,14 @@ Any AI agent or developer running this repository needs three components:
    - Verification: `ffmpeg -version` and `ffprobe -version`.
 
 3. **Python 3.10+ & Whisper (Required for AI Auto-Captions)**:
-   - The AI auto-captioning feature executes `python scripts/transcribe.py <media_path> tiny`.
+   - The AI auto-captioning feature executes `python scripts/transcribe.py <media_path> base`.
    - Install dependencies:
      ```bash
      pip install openai-whisper
      ```
-   - Whisper runs entirely locally using the `tiny` model (cached in `~/.cache/whisper`).
+   - Whisper runs entirely locally using the `base` model (staged into
+     `bin/whisper/models/base/` by `npm run setup:whisper`, cached in
+     `~/.cache/zero-flow/whisper` when fetched on demand).
 
 ---
 
@@ -66,7 +68,9 @@ Any AI agent or developer running this repository needs three components:
   - Modal with resolution presets (720p to 4K), frame rates (24, 30, 60 fps), formats (MP4, MOV, MKV), bitrate slider, estimated file size, and progress modal with "Open in Folder".
 
 - **Foldable Captions Panel (`src/components/editor/TextPanel.tsx`)**:
-  - Whisper Tiny auto-transcription with 1-click timeline placement.
+  - Whisper base (the bundled model) auto-transcription with 1-click timeline
+    placement. The model size defaults to `base` — see `DEFAULT_MODEL` in
+    `electron/whisper.ts`.
   - Foldable Caption Settings & Foldable Animation Style selector (`None/Static`, `Smooth Fade`, `Slide Up`, `Slide Left`, `Punch In`, `Elastic Pop`).
 
 ---

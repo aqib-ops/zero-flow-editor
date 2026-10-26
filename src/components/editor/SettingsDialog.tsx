@@ -195,7 +195,11 @@ function UpdatesTab({
               v{update.version} is ready. Restart to finish installing.
             </span>
           )}
-          {update.phase === "error" && <span className="text-destructive">{update.message}</span>}
+          {update.phase === "error" && (
+            <span className="text-destructive" role="alert">
+              {update.message}
+            </span>
+          )}
         </div>
 
         {update.phase === "downloading" && (

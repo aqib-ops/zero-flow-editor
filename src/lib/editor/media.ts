@@ -80,6 +80,7 @@ export function toFileUrl(path: string): string {
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    img.crossOrigin = "anonymous";
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error(`Could not decode image: ${url}`));
     img.src = url;
@@ -92,6 +93,7 @@ function loadVideo(url: string): Promise<HTMLVideoElement> {
     v.preload = "metadata";
     v.muted = true;
     v.playsInline = true;
+    v.crossOrigin = "anonymous";
     v.onloadedmetadata = () => resolve(v);
     v.onerror = () => reject(new Error(`Could not decode video: ${url}`));
     v.src = url;
@@ -108,19 +110,84 @@ function loadAudio(url: string): Promise<HTMLAudioElement> {
   });
 }
 
-function videoThumb(video: HTMLVideoElement): string | undefined {
+/**
+ * Downscale a decoded image into a small JPEG data URL for timeline/picker
+ * thumbnails. Doing this in the renderer avoids shipping the full file bytes
+ * through IPC just to encode them in the main process.
+ */
+function imageThumb(img: HTMLImageElement): string | undefined {
   try {
+    const naturalW = img.naturalWidth || 0;
+    const naturalH = img.naturalHeight || 0;
     const c = document.createElement("canvas");
-    const w = 192;
+    const w = Math.max(1, Math.min(192, naturalW || 192));
     c.width = w;
-    c.height = Math.max(1, Math.round((video.videoHeight / Math.max(1, video.videoWidth)) * w));
+    c.height = Math.max(1, Math.round((naturalH / Math.max(1, naturalW)) * w));
     const ctx = c.getContext("2d");
     if (!ctx) return undefined;
-    ctx.drawImage(video, 0, 0, c.width, c.height);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
     return c.toDataURL("image/jpeg", 0.62);
   } catch {
     return undefined;
   }
+}
+
+/** Free a detached media element so Windows releases the underlying file. */
+function releaseMedia(el: HTMLMediaElement): void {
+  try {
+    el.pause();
+    el.removeAttribute("src");
+    el.load();
+  } catch {
+    /* element already torn down */
+  }
+}
+
+/**
+ * Draw a thumbnail from ~10% into the clip. `loadeddata` alone usually paints
+ * frame 0 (often black), so seek first and draw on `seeked`. Resolves
+ * `undefined` if the frame never arrives, never rejects.
+ */
+function videoThumb(video: HTMLVideoElement): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (thumb: string | undefined) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      video.removeEventListener("seeked", draw);
+      releaseMedia(video);
+      resolve(thumb);
+    };
+    const draw = () => {
+      try {
+        const c = document.createElement("canvas");
+        const w = 192;
+        c.width = w;
+        c.height = Math.max(
+          1,
+          Math.round((video.videoHeight / Math.max(1, video.videoWidth)) * w),
+        );
+        const ctx = c.getContext("2d");
+        if (!ctx) return finish(undefined);
+        ctx.drawImage(video, 0, 0, c.width, c.height);
+        finish(c.toDataURL("image/jpeg", 0.62));
+      } catch {
+        finish(undefined);
+      }
+    };
+
+    const timer = setTimeout(draw, 2000);
+    video.addEventListener("seeked", draw, { once: true });
+
+    const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    try {
+      // Stay off the very last frame: some containers cannot seek exactly there.
+      video.currentTime = dur ? Math.min(dur * 0.1, Math.max(0.1, dur - 0.05)) : 0;
+    } catch {
+      draw();
+    }
+  });
 }
 
 /**
@@ -152,22 +219,13 @@ export async function assetFromPath(path: string, probe?: () => Promise<{
 
   try {
     if (kind === "image") {
-      let finalThumb = url;
-      if (window.zf?.media?.toDataUrl) {
-        try {
-          const dUrl = await window.zf.media.toDataUrl(path);
-          if (dUrl) finalThumb = dUrl;
-        } catch (error) {
-          console.warn("[media] thumbnail conversion failed, using source URL", path, error);
-        }
-      }
-      const img = await loadImage(finalThumb || url);
+      const img = await loadImage(url);
       return {
         ...base,
         duration: 4,
         width: img.naturalWidth || 1920,
         height: img.naturalHeight || 1080,
-        thumb: finalThumb,
+        thumb: imageThumb(img),
       };
     }
     if (kind === "video") {
@@ -191,7 +249,7 @@ export async function assetFromPath(path: string, probe?: () => Promise<{
         width: nativeW || probed?.width || 1920,
         height: nativeH || probed?.height || 1080,
         hasAudio: probed?.hasAudio ?? false,
-        thumb: videoThumb(v),
+        thumb: await videoThumb(v),
       };
     }
     const a = await loadAudio(url);
@@ -261,6 +319,11 @@ export function getImage(url: string): HTMLImageElement {
   return el;
 }
 
+/** Cached image if one exists, else null — never creates an element. */
+export function peekImage(url: string): HTMLImageElement | null {
+  return imageCache.get(url) ?? null;
+}
+
 /**
  * Wait until a cached image has decoded enough to be drawn. Export uses this
  * before compositing a frame so an image overlay can never be skipped just
@@ -311,6 +374,11 @@ export function getVideo(url: string, owner = "shared"): HTMLVideoElement {
     videoCache.set(key, el);
   }
   return el;
+}
+
+/** Cached video for an owner, else null — never creates an element. */
+export function peekVideo(url: string, owner = "shared"): HTMLVideoElement | null {
+  return videoCache.get(`${url}\0${owner}`) ?? null;
 }
 
 export function getAudio(url: string, owner = "shared"): HTMLAudioElement {

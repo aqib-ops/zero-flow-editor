@@ -60,7 +60,7 @@ export function OverlayPanel() {
           kind: "overlay",
           name: asset.name,
           start: 0,
-          duration: asset.duration || total > 0 ? total : 4,
+          duration: asset.duration || (total > 0 ? total : 4),
           opacity: 1,
           blend: "screen",
           overlay: source,
@@ -97,7 +97,8 @@ export function OverlayPanel() {
         </div>
         <p className="text-[11px] leading-relaxed text-muted-foreground">
           Import MP4/MOV/WebM with alpha (transparency), or stills. Each file is placed on the
-          Overlays track — drag, trim and re-blend them like any clip.
+          Overlays track — drag, trim and re-blend them like any clip. Overlay videos play
+          silently: their audio is not included in the export.
         </p>
       </section>
 
@@ -122,6 +123,8 @@ export function OverlayPanel() {
                 step={0.01}
                 value={selectedOverlay.opacity}
                 onChange={(e) => setOpacity(Number(e.target.value))}
+                aria-label="Overlay opacity"
+                aria-valuetext={`${Math.round(selectedOverlay.opacity * 100)} percent`}
                 className="mt-1.5 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-primary"
               />
               <div className="mt-1.5 flex items-center gap-1.5">

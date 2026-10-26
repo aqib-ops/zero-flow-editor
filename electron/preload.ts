@@ -11,6 +11,8 @@ import type {
   MediaProbe,
   OpenedScript,
   RenderProgress,
+  SetupSnapshot,
+  SetupStatus,
   UpdateStatus,
 } from "./preload-types.js";
 
@@ -22,6 +24,8 @@ export type {
   MediaProbe,
   OpenedScript,
   RenderProgress,
+  SetupSnapshot,
+  SetupStatus,
   UpdateStatus,
 };
 
@@ -54,8 +58,20 @@ const api = {
     ): Promise<{
       ok: boolean;
       segments?: Array<{ start: number; end: number; duration: number; text: string }>;
+      language?: string;
+      duration?: number;
       error?: string;
     }> => ipcRenderer.invoke("whisper:transcribe", mediaPath, model),
+  },
+
+  /** Background self-setup: FFmpeg / captions engine downloads on first run. */
+  setup: {
+    status: (): Promise<SetupSnapshot> => ipcRenderer.invoke("setup:status"),
+    onStatus: (cb: (s: SetupStatus) => void): (() => void) => {
+      const h = (_: unknown, s: SetupStatus) => cb(s);
+      ipcRenderer.on("setup:status", h);
+      return () => ipcRenderer.off("setup:status", h);
+    },
   },
 
   /** Version, engine provenance and the GitHub Releases updater. */
@@ -67,6 +83,8 @@ const api = {
     updateDownload: (): Promise<UpdateStatus> => ipcRenderer.invoke("app:update-download"),
     updateInstall: (): Promise<void> => ipcRenderer.invoke("app:update-install"),
     openExternal: (url: string): Promise<void> => ipcRenderer.invoke("app:open-external", url),
+    /** Wipe derived session caches (HTTP, code, GPU, shader). */
+    clearCache: (): Promise<void> => ipcRenderer.invoke("cache:clear"),
     onUpdateStatus: (cb: (s: UpdateStatus) => void): (() => void) => {
       const h = (_: unknown, s: UpdateStatus) => cb(s);
       ipcRenderer.on("app:update-status", h);
@@ -77,14 +95,18 @@ const api = {
   dialog: {
     openMedia: (): Promise<string[]> => ipcRenderer.invoke("dlg:open-media"),
     openScript: (): Promise<OpenedScript | null> => ipcRenderer.invoke("dlg:open-script"),
-    saveVideo: (defaultName: string): Promise<string | null> =>
-      ipcRenderer.invoke("dlg:save-video", defaultName),
-    saveProject: (data: unknown): Promise<string | null> => ipcRenderer.invoke("proj:write", data),
-    openProject: (): Promise<unknown | null> => ipcRenderer.invoke("proj:open-project"),
+    saveVideo: (defaultName: string, format?: string): Promise<string | null> =>
+      ipcRenderer.invoke("dlg:save-video", defaultName, format),
   },
 
-  project: {
-    read: (path: string): Promise<unknown> => ipcRenderer.invoke("proj:read", path),
+  /** Autosaved Recent Projects (userData/projects/*.zfp.json). */
+  projects: {
+    list: () => ipcRenderer.invoke("proj:list"),
+    load: (id: string) => ipcRenderer.invoke("proj:load", id),
+    save: (id: string, name: string, data: unknown) =>
+      ipcRenderer.invoke("proj:save", id, name, data),
+    remove: (id: string) => ipcRenderer.invoke("proj:delete", id),
+    usage: () => ipcRenderer.invoke("proj:usage"),
   },
 
   window: {
@@ -132,9 +154,9 @@ const api = {
       ipcRenderer.invoke("shell:open-folder", filePath),
   },
 
-  media: {
-    toDataUrl: (filePath: string): Promise<string | null> =>
-      ipcRenderer.invoke("media:to-data-url", filePath),
+  text: {
+    save: (req: { defaultName: string; content: string }): Promise<string | null> =>
+      ipcRenderer.invoke("text:save", req),
   },
 
   /** Whether we are running inside the Electron desktop shell. */

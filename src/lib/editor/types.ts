@@ -101,6 +101,14 @@ export interface Clip {
   lineHeight?: number;
   // overlay clips
   overlay?: OverlaySource;
+  /** Overlay centre as a fraction of canvas width (0.5 = centred). */
+  overlayX?: number;
+  /** Overlay centre as a fraction of canvas height (0.5 = centred). */
+  overlayY?: number;
+  /** Size multiplier on top of the contain-fit base (1 = full-canvas fit). */
+  overlayScale?: number;
+  /** Overlay rotation in degrees, clockwise. */
+  overlayRotation?: number;
 }
 
 export interface ProjectSettings {

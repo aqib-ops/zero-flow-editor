@@ -46,6 +46,37 @@ export function drawContain(
   ctx.drawImage(src, (W - w) / 2 + dx * W, (H - h) / 2 + dy * H, w, h);
 }
 
+/**
+ * Contain-fit draw around an arbitrary pivot with rotation, for placed
+ * overlays. The pivot is the overlay centre as a canvas fraction. With the
+ * defaults (centre pivot, no rotation) this matches drawContain exactly, so
+ * untouched overlays render identically to before.
+ */
+export function drawContainPlaced(
+  ctx: CanvasRenderingContext2D,
+  src: CanvasImageSource,
+  sw: number,
+  sh: number,
+  W: number,
+  H: number,
+  scale = 1,
+  dx = 0,
+  dy = 0,
+  pivotX = 0.5,
+  pivotY = 0.5,
+  rotationDeg = 0,
+) {
+  if (!sw || !sh) return;
+  const s = Math.min(W / sw, H / sh) * scale;
+  const w = sw * s;
+  const h = sh * s;
+  ctx.save();
+  ctx.translate(W * pivotX + dx * W, H * pivotY + dy * H);
+  if (rotationDeg) ctx.rotate((rotationDeg * Math.PI) / 180);
+  ctx.drawImage(src, -w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+
 export function animationTransform(clip: Clip, p: number) {
   const amt = clip.animationAmount ?? 0.12;
   switch (clip.animation) {
